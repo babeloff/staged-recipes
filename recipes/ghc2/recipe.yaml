@@ -36,14 +36,16 @@ requirements:
     - libffi
 
 tests:
-  - script: test.nu --debug
+  - script: nu validate.nu --debug
     files:
       recipe:
-        - test.nu
+        - validate.nu
     requirements:
       build:
         - nushell
         - ${{ compiler('c') }}
+      run:
+        - nushell
 
 about:
   homepage: https://haskell.org/ghc/
