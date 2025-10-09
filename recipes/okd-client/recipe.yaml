@@ -1,0 +1,86 @@
+schema_version: 1
+
+# Context section replaces set variables
+context:
+  name: "openshift-client"
+  version: "4.19.15"
+
+# Package information
+package:
+  name: okd-cli
+  version: ${{ version }}
+
+# Source section
+source:
+  url: https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${{ version }}/${{ name }}-src.tar.gz
+  sha256: 4c23bda233eaac582b812b9d4783be71f218de5124d673b4325377e8f325be2c
+
+# Build configuration
+build:
+  number: 0
+  script:
+    # Disable CGO for cross-compilation and macOS to avoid linker issues
+    - if: target_platform == "linux-aarch64"
+      then:
+        - export CGO_ENABLED=0
+    - if: target_platform == "osx-arm64"
+      then:
+        - export CGO_ENABLED=0
+    - if: target_platform == "osx-64"
+      then:
+        - export CGO_ENABLED=0
+    # Disable GSSAPI to avoid missing Go bindings
+    - make oc GO_BUILD_FLAGS="-mod=vendor -tags 'include_gcs include_oss containers_image_openpgp'"
+    - if: unix
+      then:
+        - mkdir -p $PREFIX/bin/
+        - cp oc $PREFIX/bin/
+        - cp oc $PREFIX/bin/okd-cli
+    - if: win
+      then:
+        - if not exist "%PREFIX%\bin" mkdir "%PREFIX%\bin"
+        - cp oc.exe %PREFIX%\bin\oc.exe
+        - cp oc.exe %PREFIX%\bin\okd-cli.exe
+
+# Requirements
+requirements:
+  build:
+    - ${{ compiler('c') }}
+    - ${{ compiler('cxx') }}
+    - ${{ stdlib('c') }}
+    - if: target_platform not in ("linux-aarch64", "osx-arm64", "osx-64")
+      then:
+        - ${{ compiler('go-cgo') }} >=1.15.2
+    - if: target_platform in ("linux-aarch64", "osx-arm64", "osx-64")
+      then:
+        - go >=1.15.2
+    - make >=4.0
+    - git >=2.0
+    - krb5 >=1.21
+    - pkg-config >=0.29
+
+# Tests
+tests:
+  - script:
+      - oc --help
+
+# About section
+about:
+  homepage: https://www.okd.io/
+  summary: OpenShift Command Line Interface
+  description: |
+    The OpenShift Command Line Interface (CLI), is a set of tools built on top of kubectl
+    that help you work with OpenShift. With the CLI, you can create applications and manage
+    OpenShift resources. It provides its full capabilities to connect with any Kubernetes
+    compliant cluster, and adds commands simplifying interaction with an OpenShift cluster.
+  license: Apache-2.0
+  license_file: LICENSE
+  repository: https://github.com/openshift/oc
+  documentation: https://docs.openshift.com/container-platform/latest/cli_reference/openshift_cli/getting-started-cli.html
+
+# Extra section
+extra:
+  recipe-maintainers:
+    - chrisburr
+    - delsner
+    - phreed
