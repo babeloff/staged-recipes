@@ -1,0 +1,47 @@
+context:
+  name: bitwarden-cli
+  version: "2025.10.0"
+
+package:
+  name: ${{ name }}
+  version: ${{ version }}
+
+source:
+  url: https://github.com/bitwarden/clients/archive/refs/tags/cli-v${{ version }}.tar.gz
+  sha256: e9f5b989e3403525c08ef0d295e7a315de2e5f05121e67b0352fed21417277df
+
+build:
+  number: 0
+  script:
+    # The tarball extracts to a directory like `clients-cli-v2025.10.0`
+    # We need to cd into that directory first.
+    - cd clients-*/apps/cli
+    - npm install
+    - npm run build:oss:prod
+    - npm install . --prefix ${{ build.prefix }}
+
+requirements:
+  host:
+    - nodejs
+    - pnpm
+    - webpack-cli
+    - cross-env
+  run:
+    - nodejs
+
+tests:
+  - command:
+      - bw --version
+  - files:
+      - bin/bw
+
+about:
+  homepage: https://bitwarden.com
+  license: GPL-3.0-only
+  summary: "A secure and free password manager for all of your devices."
+  doc_url: https://bitwarden.com/help/cli/
+  dev_url: https://github.com/bitwarden/clients/tree/main/apps/cli
+
+extra:
+  recipe-maintainers:
+    - phreed
