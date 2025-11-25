@@ -7,31 +7,36 @@ package:
   version: ${{ version }}
 
 source:
-  url: https://github.com/bitwarden/clients/archive/refs/tags/cli-v${{ version }}.tar.gz
-  sha256: e9f5b989e3403525c08ef0d295e7a315de2e5f05121e67b0352fed21417277df
-  file_name: bitwarden-cli-${{ version }}.tgz
+  url: https://registry.npmjs.org/@bitwarden/cli/-/cli-${{ version }}.tgz
+  sha256: 4a1055bb01a3ea9eabb0b437c0bf6a228b924886fc77407fff48503c1457b403 # TODO: Update with correct SHA256 hash
 
 build:
   number: 0
   script:
-    - npm install -g bitwarden-cli-${{ version }}.tgz --prefix ${{ PREFIX }}
-    # - find ${{ PREFIX }} -type f -executable -exec chmod +x {} \;
+    # Extract the package
+    - tar -xzf cli-${{ version }}.tgz
+    - cd package
+    # Install dependencies for license generation
+    - pnpm install --prod
+    # Generate license files
+    - mkdir -p ${{ PREFIX }}/share/licenses/${{ name }}
+    - npx @quantco/pnpm-licenses list --prod --json --output-file ${{ PREFIX }}/share/licenses/${{ name }}/licenses.json
+    - npx @quantco/pnpm-licenses generate-disclaimer --prod --output-file ${{ PREFIX }}/share/licenses/${{ name }}/THIRD_PARTY_LICENSES.txt
+    # Install the CLI globally using pnpm
+    - pnpm install -g . --prefix ${{ PREFIX }}
 
 requirements:
   host:
     - nodejs
     - pnpm
-    - webpack-cli
-    - crossenv
+    - npm
   run:
     - nodejs
 
 tests:
-  # - package_contents:
-  #     bin:
-  #       - bw
-  # - script:
-  #     - bw --version
+  commands:
+    - bw --version
+    - bw --help
 
 about:
   homepage: https://bitwarden.com/help/cli/
