@@ -1,14 +1,14 @@
 context:
   name: rotz
-  version: "1.2.1"
+  version: "1.2.3"
 
 package:
   name: ${{ name|lower }}
   version: ${{ version }}
 
 source:
-  url: https://github.com/volllly/rotz/archive/refs/tags/v${{ version }}.tar.gz
-  sha256: 61bae45578e988c627a8db36fcc934d8d21e30735f576c77312ba7dd66fd99bb
+  url: https://github.com/babeloff/rotz/archive/refs/tags/v${{ version }}.tar.gz
+  sha256: 2942359688bbad11848c18d523dfd29dbc20f27a37db394185dc787f72687b1c
 
 build:
   number: 0
@@ -54,7 +54,7 @@ about:
     - LICENSE
     - THIRDPARTY.yml
   documentation: https://docs.rs/rotz/
-  repository: https://github.com/volllly/rotz
+  repository: https://github.com/babeloff/rotz
 
 extra:
   recipe-maintainers:
