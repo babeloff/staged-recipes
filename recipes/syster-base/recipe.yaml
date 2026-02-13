@@ -2,7 +2,7 @@
 # Based on rattler-build Rust tutorial: https://rattler-build.prefix.dev/latest/tutorials/rust/
 
 context:
-  version: "0.3.1_alpha"
+  version: "0.3.5_alpha"
   git_tag: ${{ version | replace('_', '-') }}
 
 package:
@@ -11,7 +11,7 @@ package:
 
 source:
   - url: https://github.com/jade-codes/syster-base/archive/refs/tags/v${{ git_tag }}.tar.gz
-    sha256: 364c55aca00876c2ad1bde8acc177a5604f801ebfc69e513757ba05ff247a586
+    sha256: ab33e8f845ab7c7f60001d52548c2ec952ac7d2ea61bdc8fde619c06ab3b91d6
   - path: LICENSE
 
 build:
