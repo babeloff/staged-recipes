@@ -1,0 +1,125 @@
+context:
+  version: "2.5.1"
+  openconnect_commit: "0dcdff87db65daf692dc323732831391d595d98d"
+  libxml2_commit: "f8a8c1f59db355b46962577e7b74f1a1e8149dc6"
+
+package:
+  name: globalprotect-openconnect
+  version: ${{ version }}
+
+source:
+  - url: https://github.com/yuezk/GlobalProtect-openconnect/archive/refs/tags/v${{ version }}.tar.gz
+    sha256: b991582beb92628a9babee4f81abb0d93df2b6c7a3bfff4324b7f0e80444799e
+  - url: https://gitlab.com/openconnect/openconnect/-/archive/${{ openconnect_commit }}/openconnect-${{ openconnect_commit }}.tar.gz
+    sha256: efb4a49ed9866c91b37ca95aad7a89aa092447e322c81d8508c05ef1254c01e3
+    target_directory: crates/openconnect/deps/openconnect
+  - url: https://gitlab.gnome.org/GNOME/libxml2/-/archive/${{ libxml2_commit }}/libxml2-${{ libxml2_commit }}.tar.gz
+    sha256: 67ec27ab453fe92f49c574119195242cb94ca5cb219762ee22b8e8f8495096d5
+    target_directory: crates/openconnect/deps/libxml2
+
+build:
+  number: 0
+  skip:
+    - not linux
+
+requirements:
+  build:
+    - ${{ compiler('c') }}
+    - ${{ compiler('cxx') }}
+    - ${{ stdlib('c') }}
+    - ${{ compiler('rust') }}
+    - cargo-bundle-licenses
+    - make
+    - pkg-config
+    - patch
+    - autoconf
+    - automake
+    - libtool
+  host:
+    # GTK3 and its pkg-config transitive dependencies
+    - gtk3
+    - glib
+    - pango
+    - cairo
+    - gdk-pixbuf
+    - atk
+    - harfbuzz
+    - fontconfig
+    - freetype
+    - pixman
+    - fribidi
+    - epoxy
+    - expat
+    - xorg-libx11
+    - xorg-libxext
+    - xorg-libxrender
+    - xorg-libxcb
+    # vendored openconnect build dependencies
+    - libiconv
+    - zlib
+    - lz4
+    - gnutls
+    - p11-kit
+    - nettle
+    - gmp
+    - libxml2
+    - openssl
+  ignore_run_exports:
+    from_package:
+      # All host packages are only needed at compile time. The actual runtime
+      # dependencies are openconnect and gtk3 (listed in run), which bring
+      # their own compatible transitive libraries. Ignoring run_exports from
+      # all host packages prevents unsolvable version pin conflicts.
+      - gtk3
+      - glib
+      - pango
+      - cairo
+      - gdk-pixbuf
+      - atk
+      - harfbuzz
+      - fontconfig
+      - freetype
+      - pixman
+      - fribidi
+      - epoxy
+      - expat
+      - xorg-libx11
+      - xorg-libxext
+      - xorg-libxrender
+      - xorg-libxcb
+      - libiconv
+      - zlib
+      - lz4
+      - gnutls
+      - p11-kit
+      - nettle
+      - gmp
+      - libxml2
+      - openssl
+  run:
+    - openconnect
+    - gtk3
+    - ca-certificates
+
+tests:
+  - script:
+      - gpclient --version
+      - gpauth --version
+
+about:
+  homepage: https://github.com/yuezk/GlobalProtect-openconnect
+  summary: A GlobalProtect VPN client for Linux, based on OpenConnect
+  description: |
+    GlobalProtect-openconnect is a GlobalProtect VPN client for Linux,
+    based on OpenConnect and built with Rust. It provides CLI tools
+    (gpclient, gpauth, gpservice) for connecting to GlobalProtect
+    VPN gateways.
+  license: GPL-3.0-only
+  license_file:
+    - LICENSE
+    - THIRDPARTY.yml
+  repository: https://github.com/yuezk/GlobalProtect-openconnect
+
+extra:
+  recipe-maintainers:
+    - phreed
