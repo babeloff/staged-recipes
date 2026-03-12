@@ -1,0 +1,64 @@
+context:
+  version: "0.1.1"
+
+package:
+  name: solo1
+  version: ${{ version }}
+
+source:
+  url: https://files.pythonhosted.org/packages/e7/69/07216156c936c9be5e26f53b8b9bed0e45fe255f5ad6f09a5dd360715196/solo1-${{ version }}.tar.gz
+  sha256: bf9f5cd31e914e9b3d3a28f75cddba2fdbff8c8f73981d210ab3d246cc37df39
+
+build:
+  noarch: python
+  script: python -m pip install . -vv
+  number: 0
+
+requirements:
+  host:
+    - python
+    - pip
+    - flit
+    - click >=7.1
+    - cryptography
+    - ecdsa
+    - fido2 >=0.9.1,<1.0
+    - intelhex
+    - pyserial
+    - pyusb
+    - requests
+  run:
+    - python
+    - click >=7.1
+    - cryptography
+    - ecdsa
+    - fido2 >=0.9.1,<1.0
+    - intelhex
+    - pyserial
+    - pyusb
+    - requests
+
+tests:
+  - python:
+      imports:
+        - solo
+        - solo.client
+      pip_check: true
+
+about:
+  homepage: https://github.com/solokeys/solo1-cli
+  summary: Python library and CLI for SoloKeys Solo 1 hardware security keys
+  description: |
+    solo1 is a Python library and command-line tool for interacting with
+    Solo 1 FIDO2/U2F hardware security keys. It supports programming,
+    updating, and managing Solo 1 devices. This package was formerly
+    known as solo-python.
+  license: Apache-2.0 OR MIT
+  license_file:
+    - LICENSE-APACHE
+    - LICENSE-MIT
+  repository: https://github.com/solokeys/solo1-cli
+
+extra:
+  recipe-maintainers:
+    - babeloff
