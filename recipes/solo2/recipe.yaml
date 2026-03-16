@@ -1,0 +1,46 @@
+context:
+  version: "0.2.2"
+
+package:
+  name: solo2
+  version: ${{ version }}
+
+source:
+  url: https://github.com/solokeys/solo2-cli/archive/refs/tags/v${{ version }}.tar.gz
+  sha256: 49a30c5ee6f38be968a520089741f8b936099611e98e6bf2b25d05e5e9335fb4
+
+build:
+  script: cargo install --no-track --root $PREFIX --path .
+  number: 0
+
+requirements:
+  build:
+    - ${{ compiler('c') }}
+    - ${{ stdlib('c') }}
+    - rust
+  host:
+    - if: linux
+      then:
+        - pcsclite
+        - eudev
+
+tests:
+  - script:
+      - solo2 --version
+
+about:
+  homepage: https://github.com/solokeys/solo2-cli
+  summary: Library and CLI for the SoloKeys Solo 2 security key
+  description: |
+    solo2 is a Rust library and command-line tool for interacting with
+    SoloKeys Solo 2 FIDO2 hardware security keys. It supports programming,
+    updating, and managing Solo 2 devices.
+  license: Apache-2.0 OR MIT
+  license_file:
+    - LICENSE-APACHE
+    - LICENSE-MIT
+  repository: https://github.com/solokeys/solo2-cli
+
+extra:
+  recipe-maintainers:
+    - babeloff
