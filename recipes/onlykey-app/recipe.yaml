@@ -1,0 +1,38 @@
+schema_version: 1
+
+context:
+  version: "5.5.0"
+
+package:
+  name: onlykey-app
+  version: ${{ version }}
+
+source:
+  - if: target_platform == "linux-64"
+    then:
+      url: https://github.com/trustcrypto/OnlyKey-App/releases/download/v${{ version }}/OnlyKey_${{ version }}_amd64.deb
+      sha256: f00f056a3432d624a805596a6c6b0f2ce5d8efa8c95da1baac39599946301065
+      file_name: OnlyKey_${{ version }}_amd64.deb
+
+build:
+  number: 1
+
+tests:
+  - script:
+      - test -x $PREFIX/opt/OnlyKey/nw
+
+about:
+  homepage: https://docs.crp.to/app.html
+  license: LicenseRef-OnlyKey
+  license_file: LICENSE.txt
+  summary: OnlyKey App for setup and configuration of the OnlyKey hardware security key.
+  description: |
+    The OnlyKey App is used for the initial setup and configuration of OnlyKey.
+    It supports account slot management (usernames, passwords, URLs, 2FA tokens),
+    loading PGP/SSH keys, device backup/restore, and OATH-TOTP configuration.
+    Supported on Windows, macOS, Linux, and Chromebook.
+  repository: https://github.com/trustcrypto/OnlyKey-App
+
+extra:
+  recipe-maintainers:
+    - babeloff
