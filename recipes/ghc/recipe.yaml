@@ -1,0 +1,62 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/prefix-dev/recipe-format/main/schema.json
+# Repackages pre-built GHC bindists from downloads.haskell.org (GHCup-style)
+
+context:
+  name: ghc
+  version: "9.6.7"
+
+package:
+  name: ${{ name }}
+  version: ${{ version }}
+
+source:
+  - if: target_platform == "linux-64"
+    then:
+      url: https://downloads.haskell.org/ghcup/unofficial-bindists/ghc/${{ version }}/ghc-${{ version }}-x86_64-rocky8-linux.tar.xz
+      sha256: e1078062054732eb12ec0267d74a72362a5fc66d45cf0aeebbf4caf425e264e5
+  - if: target_platform == "linux-aarch64"
+    then:
+      url: https://downloads.haskell.org/ghcup/unofficial-bindists/ghc/${{ version }}/ghc-${{ version }}-aarch64-deb10-linux.tar.xz
+      sha256: 6fde41f84494c126de3ec6f3642646733914a594355b5c395da363ca93658c26
+  - if: target_platform == "osx-64"
+    then:
+      url: https://downloads.haskell.org/ghcup/unofficial-bindists/ghc/${{ version }}/ghc-${{ version }}-x86_64-apple-darwin.tar.xz
+      sha256: f6ee37851b2e0ac99d46d82d9c0dcca33f575b5d9e55c181b6ff2c6db06aaa55
+  - if: target_platform == "osx-arm64"
+    then:
+      url: https://downloads.haskell.org/ghcup/unofficial-bindists/ghc/${{ version }}/ghc-${{ version }}-aarch64-apple-darwin.tar.xz
+      sha256: 1d1e6c64b054310a96f0950b32e21ecaeed15e7a9d94bebb9ad5ec5334006a5d
+
+build:
+  number: 0
+  skip:
+    - win
+
+requirements:
+  build:
+    - ${{ compiler("c") }}
+    - make
+  run:
+    - libgcc-ng  # [linux]
+    - libstdc++-ng  # [linux]
+
+tests:
+  - script:
+      - ghc --version
+      - ghc-pkg list
+
+about:
+  homepage: https://www.haskell.org/ghc/
+  license: BSD-3-Clause
+  license_file: LICENSE
+  summary: The Glasgow Haskell Compiler
+  description: |
+    GHC is a state-of-the-art, open source, compiler and interactive environment
+    for the functional language Haskell. This package repackages the official
+    pre-built GHC bindists from downloads.haskell.org.
+  repository: https://gitlab.haskell.org/ghc/ghc
+  documentation: https://downloads.haskell.org/ghc/latest/docs/users_guide/
+
+extra:
+  recipe-maintainers:
+    - phreed
