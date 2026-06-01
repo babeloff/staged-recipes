@@ -32,10 +32,11 @@ source:
   # - url: https://github.com/jank-lang/cpptrace/archive/ce639ebfcec47a7c74233b4bab50017cb34e615b.tar.gz
   #   sha256: 3fa01f9c5ca84cc642a66ad30b5798dd031a4d0a2c2cd7581bf4d8b1aa206d26
   #   target_directory: compiler+runtime/third-party/cpptrace
-  # https://prefix.dev/channels/conda-forge/packages/cppinterop >=1.9.0
-  # - url: https://github.com/jank-lang/CppInterOp/archive/8ce59d7aa4443098f2a6df4cb859732d9b6a76b0.tar.gz
-  #   sha256: f2f98386e631a271e24e79160a79e2b2ac9c5baf8537643c330ebd3dc7c011e2
-  #   target_directory: compiler+runtime/third-party/cppinterop
+  # https://prefix.dev/channels/conda-forge/packages/cppinterop — blocked: only LLVM 21 builds
+  # exist on conda-forge; no clang22 variant available for cppinterop 1.9.0
+  - url: https://github.com/jank-lang/CppInterOp/archive/8ce59d7aa4443098f2a6df4cb859732d9b6a76b0.tar.gz
+    sha256: f2f98386e631a271e24e79160a79e2b2ac9c5baf8537643c330ebd3dc7c011e2
+    target_directory: compiler+runtime/third-party/cppinterop
   # https://prefix.dev/channels/conda-forge/packages/bdw-gc
   # - url: https://github.com/jank-lang/bdwgc/archive/327ef1f8c80a611b2f8b915850c8b2fd38e6595e.tar.gz
   #   sha256: 0c273a852db08def4e447d2f82b081c6f595f1e65169750bf5374e485a8311de
@@ -139,9 +140,8 @@ requirements:
 
   host:
     - bdw-gc
-    - boost-cpp >=1.85.0
+    - libboost-devel
     - bzip2
-    - cppinterop >=1.9.0
     - cpptrace >=1.0.4
     - doctest >=2.5.2
     - double-conversion
