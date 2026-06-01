@@ -52,7 +52,7 @@ source:
   # - url: https://github.com/jank-lang/doctest/archive/d44d4f6e66232d716af82f00a063759e9d0e50d6.tar.gz
   #   sha256: 5c3682e391ce01c16d9b1e2b3d890366a7a10e35d32fa94d8443b21cdbde94c7
   #   target_directory: compiler+runtime/third-party/doctest
-  # https://prefix.dev/channels/conda-forge/packages/boost-cpp >=1.85.0 (process, preprocessor, multiprecision)
+  # https://prefix.dev/channels/conda-forge/packages/libboost-devel (process, preprocessor, multiprecision)
   # https://github.com/boostorg/process
   # - url: https://github.com/jank-lang/boost-process/archive/e4d0d405a12f13ebe7d894382d3a98830ae1c7bd.tar.gz
   #   sha256: 4f9c30b47368bea905272fb36e8a3a32f93f69f44e0cd5ebac7ee68870018b57
@@ -139,7 +139,7 @@ requirements:
 
   host:
     - bdw-gc
-    - boost-cpp >=1.85.0
+    - libboost-devel
     - bzip2
     - cppinterop >=1.9.0
     - cpptrace >=1.0.4
