@@ -36,10 +36,10 @@ source:
   # - url: https://github.com/jank-lang/CppInterOp/archive/8ce59d7aa4443098f2a6df4cb859732d9b6a76b0.tar.gz
   #   sha256: f2f98386e631a271e24e79160a79e2b2ac9c5baf8537643c330ebd3dc7c011e2
   #   target_directory: compiler+runtime/third-party/cppinterop
-  # https://prefix.dev/channels/conda-forge/packages/bdw-gc
-  - url: https://github.com/jank-lang/bdwgc/archive/327ef1f8c80a611b2f8b915850c8b2fd38e6595e.tar.gz
-    sha256: 0c273a852db08def4e447d2f82b081c6f595f1e65169750bf5374e485a8311de
-    target_directory: compiler+runtime/third-party/bdwgc
+  # https://prefix.dev/channels/conda-forge/packages/bdw-gc (host dependency)
+  # - url: https://github.com/jank-lang/bdwgc/archive/327ef1f8c80a611b2f8b915850c8b2fd38e6595e.tar.gz
+  #   sha256: 0c273a852db08def4e447d2f82b081c6f595f1e65169750bf5374e485a8311de
+  #   target_directory: compiler+runtime/third-party/bdwgc
   # https://github.com/mariusbancila/stduuid
   - url: https://github.com/jank-lang/stduuid/archive/3afe7193facd5d674de709fccc44d5055e144d7a.tar.gz
     sha256: e11f9bf30c7f9c03d8e9a3a3fd7fe016eb5d8d9b89a2fe2c11b5f049e1d97916
