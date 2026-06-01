@@ -13,3 +13,6 @@ cxx_compiler_version:
 # https://conda-forge.org/docs/maintainer/knowledge_base#newer-c-features-with-old-sdk
 c_stdlib_version:    # [osx]
   - '13.3'           # [osx]
+# folly 2026.05.25.00 requires libboost >=1.90.0; override the global 1.88.* pin.
+libboost_devel:
+  - '1.90'

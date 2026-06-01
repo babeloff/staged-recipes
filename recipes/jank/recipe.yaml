@@ -16,11 +16,10 @@ source:
   - url: https://github.com/jank-lang/clojure-test-suite/archive/1cbab0f3981bae87830cc6daacbbede20cea3516.tar.gz
     sha256: a006f9f9bebf3c792ca39798c84c7e8e90defecd12cc42067b475af121cc1900
     target_directory: compiler+runtime/test/bash/clojure-test-suite/clojure-test-suite
-  # https://prefix.dev/channels/conda-forge/packages/folly — blocked: folly 2026.05.25.00
-  # requires libboost >=1.90.0 but conda-forge global pinning pins libboost-devel to 1.88.*
-  - url: https://github.com/jank-lang/folly/archive/39b8a05c3adc8d992d2aac499b53b3c2895cd637.tar.gz
-    sha256: a413f74ab5ee315c0d4646d55d60d691146e0db8dae5db70072fa486ebd840f6
-    target_directory: compiler+runtime/third-party/folly
+  # https://prefix.dev/channels/conda-forge/packages/folly >=2026.05.25.00
+  # - url: https://github.com/jank-lang/folly/archive/39b8a05c3adc8d992d2aac499b53b3c2895cd637.tar.gz
+  #   sha256: a413f74ab5ee315c0d4646d55d60d691146e0db8dae5db70072fa486ebd840f6
+  #   target_directory: compiler+runtime/third-party/folly
   # https://github.com/arximboldi/immer
   - url: https://github.com/jank-lang/immer/archive/282629d01917d4c7d0aba2322de700c6d1111276.tar.gz
     sha256: 21a6ef49a3e9ab3c8613fc5a6ef4b8f3ad2abce0d4ceb00e4be1bce052e6532a
@@ -149,6 +148,7 @@ requirements:
     - if: linux
       then: elfutils
     - fmt
+    - folly >=2026.05.25.00
     - ftxui >=6.1.9
     - gmp
     - libatomic_ops
