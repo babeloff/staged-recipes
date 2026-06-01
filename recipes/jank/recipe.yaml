@@ -114,9 +114,11 @@ build:
       # and redirects cmake to the system packages in the host environment.
       # (Must be single-line strings: multi-line literals at column 0 break the YAML block scalar.)
       ^mkdir -p third-party/ftxui third-party/cpptrace third-party/boost-multiprecision third-party/bdwgc
-      "cmake_minimum_required(VERSION 3.13)\nproject(ftxui-system)\nfind_package(ftxui REQUIRED)\n" | save --force "third-party/ftxui/CMakeLists.txt"
-      "cmake_minimum_required(VERSION 3.13)\nproject(cpptrace-system)\nfind_package(cpptrace REQUIRED)\n" | save --force "third-party/cpptrace/CMakeLists.txt"
-      "cmake_minimum_required(VERSION 3.13)\nproject(boost-multiprecision-system)\nfind_package(Boost REQUIRED)\n" | save --force "third-party/boost-multiprecision/CMakeLists.txt"
+      # IMPORTED targets from find_package inside add_subdirectory are directory-scoped by
+      # default; set IMPORTED_GLOBAL TRUE so they are visible in the parent CMakeLists.txt.
+      "cmake_minimum_required(VERSION 3.13)\nproject(ftxui-system)\nfind_package(ftxui REQUIRED)\nforeach(_t ftxui::screen ftxui::dom ftxui::component)\n  if(TARGET ${_t})\n    set_target_properties(${_t} PROPERTIES IMPORTED_GLOBAL TRUE)\n  endif()\nendforeach()\n" | save --force "third-party/ftxui/CMakeLists.txt"
+      "cmake_minimum_required(VERSION 3.13)\nproject(cpptrace-system)\nfind_package(cpptrace REQUIRED)\nif(TARGET cpptrace::cpptrace)\n  set_target_properties(cpptrace::cpptrace PROPERTIES IMPORTED_GLOBAL TRUE)\nendif()\n" | save --force "third-party/cpptrace/CMakeLists.txt"
+      "cmake_minimum_required(VERSION 3.13)\nproject(boost-multiprecision-system)\nfind_package(Boost REQUIRED)\nforeach(_t Boost::boost Boost::headers Boost::multiprecision)\n  if(TARGET ${_t})\n    set_target_properties(${_t} PROPERTIES IMPORTED_GLOBAL TRUE)\n  endif()\nendforeach()\n" | save --force "third-party/boost-multiprecision/CMakeLists.txt"
       # bdw-gc ships no cmake config — use pkg-config to construct bdwgc::gc and bdwgc::gctba
       "cmake_minimum_required(VERSION 3.13)\nproject(bdwgc-system)\nfind_package(PkgConfig REQUIRED)\npkg_check_modules(BDW_GC REQUIRED bdw-gc)\nadd_library(bdwgc::gc SHARED IMPORTED GLOBAL)\nfind_library(GC_LIB NAMES gc HINTS ${BDW_GC_LIBRARY_DIRS})\nset_target_properties(bdwgc::gc PROPERTIES\n  IMPORTED_LOCATION \"${GC_LIB}\"\n  INTERFACE_INCLUDE_DIRECTORIES \"${BDW_GC_INCLUDE_DIRS}\"\n  INTERFACE_LINK_LIBRARIES \"-lpthread;-ldl\")\nadd_library(bdwgc::gctba SHARED IMPORTED GLOBAL)\nfind_library(GCTBA_LIB NAMES gctba HINTS ${BDW_GC_LIBRARY_DIRS})\nset_target_properties(bdwgc::gctba PROPERTIES\n  IMPORTED_LOCATION \"${GCTBA_LIB}\"\n  INTERFACE_INCLUDE_DIRECTORIES \"${BDW_GC_INCLUDE_DIRS}\"\n  INTERFACE_LINK_LIBRARIES bdwgc::gc)\n" | save --force "third-party/bdwgc/CMakeLists.txt"
 
