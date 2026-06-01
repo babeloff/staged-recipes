@@ -24,25 +24,26 @@ source:
   - url: https://github.com/jank-lang/immer/archive/282629d01917d4c7d0aba2322de700c6d1111276.tar.gz
     sha256: 21a6ef49a3e9ab3c8613fc5a6ef4b8f3ad2abce0d4ceb00e4be1bce052e6532a
     target_directory: compiler+runtime/third-party/immer
-  # https://prefix.dev/channels/conda-forge/packages/ftxui >=6.1.9 — cmake/dependency/ftxui.cmake
-  # uses add_subdirectory unconditionally; source must be present
-  - url: https://github.com/jank-lang/FTXUI/archive/daa421fa6ad97c8a6c9bd43f77c81862bfa52c77.tar.gz
-    sha256: 8d7bc511eca464876001ed83e804a953297ecdb02afa377d1b49587e1c721ab0
-    target_directory: compiler+runtime/third-party/ftxui
-  # https://prefix.dev/channels/conda-forge/packages/cpptrace >=1.0.4 — same: no find_package fallback
-  - url: https://github.com/jank-lang/cpptrace/archive/ce639ebfcec47a7c74233b4bab50017cb34e615b.tar.gz
-    sha256: 3fa01f9c5ca84cc642a66ad30b5798dd031a4d0a2c2cd7581bf4d8b1aa206d26
-    target_directory: compiler+runtime/third-party/cpptrace
+  # https://prefix.dev/channels/conda-forge/packages/ftxui >=6.1.9
+  # cmake/dependency/ftxui.cmake uses unconditional add_subdirectory; a stub CMakeLists.txt
+  # created in the build script redirects it to find_package(ftxui) instead.
+  # - url: https://github.com/jank-lang/FTXUI/archive/daa421fa6ad97c8a6c9bd43f77c81862bfa52c77.tar.gz
+  #   sha256: 8d7bc511eca464876001ed83e804a953297ecdb02afa377d1b49587e1c721ab0
+  #   target_directory: compiler+runtime/third-party/ftxui
+  # https://prefix.dev/channels/conda-forge/packages/cpptrace >=1.0.4 — same stub approach
+  # - url: https://github.com/jank-lang/cpptrace/archive/ce639ebfcec47a7c74233b4bab50017cb34e615b.tar.gz
+  #   sha256: 3fa01f9c5ca84cc642a66ad30b5798dd031a4d0a2c2cd7581bf4d8b1aa206d26
+  #   target_directory: compiler+runtime/third-party/cpptrace
   # https://prefix.dev/channels/conda-forge/packages/cppinterop — blocked: only LLVM 21 builds
   # exist on conda-forge; no clang22 variant available for cppinterop 1.9.0
   - url: https://github.com/jank-lang/CppInterOp/archive/8ce59d7aa4443098f2a6df4cb859732d9b6a76b0.tar.gz
     sha256: f2f98386e631a271e24e79160a79e2b2ac9c5baf8537643c330ebd3dc7c011e2
     target_directory: compiler+runtime/third-party/cppinterop
-  # https://prefix.dev/channels/conda-forge/packages/bdw-gc — cmake/dependency/bdwgc.cmake
-  # has a find_package attempt but bdw-gc doesn't ship cmake config; falls to add_subdirectory
-  - url: https://github.com/jank-lang/bdwgc/archive/327ef1f8c80a611b2f8b915850c8b2fd38e6595e.tar.gz
-    sha256: 0c273a852db08def4e447d2f82b081c6f595f1e65169750bf5374e485a8311de
-    target_directory: compiler+runtime/third-party/bdwgc
+  # https://prefix.dev/channels/conda-forge/packages/bdw-gc — no cmake config shipped;
+  # stub uses pkg-config to construct bdwgc::gc and bdwgc::gctba IMPORTED targets
+  # - url: https://github.com/jank-lang/bdwgc/archive/327ef1f8c80a611b2f8b915850c8b2fd38e6595e.tar.gz
+  #   sha256: 0c273a852db08def4e447d2f82b081c6f595f1e65169750bf5374e485a8311de
+  #   target_directory: compiler+runtime/third-party/bdwgc
   # https://github.com/mariusbancila/stduuid
   - url: https://github.com/jank-lang/stduuid/archive/3afe7193facd5d674de709fccc44d5055e144d7a.tar.gz
     sha256: e11f9bf30c7f9c03d8e9a3a3fd7fe016eb5d8d9b89a2fe2c11b5f049e1d97916
@@ -64,11 +65,11 @@ source:
   # - url: https://github.com/jank-lang/boost-preprocessor/archive/c4ea7e40d365ba28faecef8917d5c3f1e0121bf9.tar.gz
   #   sha256: f9c48540b33defa2b76689b2d005cd3711eadf53960916db543470a00b8d1bfc
   #   target_directory: compiler+runtime/third-party/boost-preprocessor
-  # https://github.com/boostorg/multiprecision — cmake/dependency/boost-multiprecision.cmake
-  # uses add_subdirectory unconditionally; libboost-devel does not cover this
-  - url: https://github.com/jank-lang/boost-multiprecision/archive/2b3ab082fac41c0d4bdb5a1c3daf7411be6fd679.tar.gz
-    sha256: 9993b263a5b3d7a8ad80a58f76c950bcc3ef8148cb80f27a8638e9fc8691f5cb
-    target_directory: compiler+runtime/third-party/boost-multiprecision
+  # https://github.com/boostorg/multiprecision — stub CMakeLists.txt calls find_package(Boost)
+  # which provides Boost::multiprecision and Boost::boost from libboost-devel (header-only)
+  # - url: https://github.com/jank-lang/boost-multiprecision/archive/2b3ab082fac41c0d4bdb5a1c3daf7411be6fd679.tar.gz
+  #   sha256: 9993b263a5b3d7a8ad80a58f76c950bcc3ef8148cb80f27a8638e9fc8691f5cb
+  #   target_directory: compiler+runtime/third-party/boost-multiprecision
 
 build:
   number: 1
@@ -104,6 +105,42 @@ build:
       } else {
         $"-L($env.PREFIX)/lib -ldl -lzstd -pthread -Wl,--no-as-needed"
       }
+
+      # jank's cmake/dependency/*.cmake files call add_subdirectory unconditionally with no
+      # find_package fallback. Create stub CMakeLists.txt files so add_subdirectory succeeds
+      # and redirects cmake to the system packages in the host environment.
+      ^mkdir -p third-party/ftxui third-party/cpptrace third-party/boost-multiprecision third-party/bdwgc
+      'cmake_minimum_required(VERSION 3.13)
+project(ftxui-system)
+find_package(ftxui REQUIRED)
+' | save --force "third-party/ftxui/CMakeLists.txt"
+      'cmake_minimum_required(VERSION 3.13)
+project(cpptrace-system)
+find_package(cpptrace REQUIRED)
+' | save --force "third-party/cpptrace/CMakeLists.txt"
+      'cmake_minimum_required(VERSION 3.13)
+project(boost-multiprecision-system)
+find_package(Boost REQUIRED)
+' | save --force "third-party/boost-multiprecision/CMakeLists.txt"
+      # bdw-gc ships no cmake config — only pkg-config. Create bdwgc::gc and bdwgc::gctba
+      # IMPORTED targets manually from the pkg-config provided shared libraries.
+      'cmake_minimum_required(VERSION 3.13)
+project(bdwgc-system)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(BDW_GC REQUIRED bdw-gc)
+add_library(bdwgc::gc SHARED IMPORTED GLOBAL)
+find_library(GC_LIB NAMES gc HINTS ${BDW_GC_LIBRARY_DIRS})
+set_target_properties(bdwgc::gc PROPERTIES
+  IMPORTED_LOCATION "${GC_LIB}"
+  INTERFACE_INCLUDE_DIRECTORIES "${BDW_GC_INCLUDE_DIRS}"
+  INTERFACE_LINK_LIBRARIES "-lpthread;-ldl")
+add_library(bdwgc::gctba SHARED IMPORTED GLOBAL)
+find_library(GCTBA_LIB NAMES gctba HINTS ${BDW_GC_LIBRARY_DIRS})
+set_target_properties(bdwgc::gctba PROPERTIES
+  IMPORTED_LOCATION "${GCTBA_LIB}"
+  INTERFACE_INCLUDE_DIRECTORIES "${BDW_GC_INCLUDE_DIRS}"
+  INTERFACE_LINK_LIBRARIES bdwgc::gc)
+' | save --force "third-party/bdwgc/CMakeLists.txt"
 
       ^./bin/configure -GNinja -DCMAKE_BUILD_TYPE=Release $"-DCMAKE_PREFIX_PATH=($env.PREFIX)" $"-Dclang_dir=($env.PREFIX)" $"-DCMAKE_EXE_LINKER_FLAGS=($linker_flags)"
 
