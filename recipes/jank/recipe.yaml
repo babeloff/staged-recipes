@@ -104,13 +104,17 @@ build:
       # the flag from its archive-path argument when processing the expanded list, so
       # -force_load silently becomes a no-op. -all_load is a global alternative that does
       # not require flag-path adjacency.
-      # bdwgc (libgc) is the SYSTEM shared library (not bundled). The ar-merge script only
-      # captures object files from ar invocations; IMPORTED SHARED targets like bdwgc::gc
-      # are never passed to ar. Add -lgc explicitly so the final link resolves GC_malloc etc.
+      # bdwgc (libgc) and ftxui are SYSTEM shared libraries (not bundled). The ar-merge script
+      # only captures object files from ar invocations; IMPORTED SHARED targets are never passed
+      # to ar. Add each library explicitly so the final link resolves their symbols:
+      #   -lgc        BDW GC core (GC_malloc, GC_free, GC_malloc_atomic, ...)
+      #   -lgctba     GC C++ bad alloc (GC_throw_bad_alloc) — libgctba = GC Throw Bad Alloc
+      #   -lgccpp     GC C++ interface wrapper (additional C++ support)
+      #   -lftxui-dom, -lftxui-screen  FTXUI rendering (text, vbox, hbox, Screen::Create, ...)
       let linker_flags = if ($env.HOST | str contains "darwin") {
-        $"-L($env.PREFIX)/lib -lzstd -lgc -Wl,-all_load"
+        $"-L($env.PREFIX)/lib -lzstd -lgc -lgctba -lgccpp -lftxui-dom -lftxui-screen -Wl,-all_load"
       } else {
-        $"-L($env.PREFIX)/lib -ldl -lzstd -lgc -pthread -Wl,--no-as-needed"
+        $"-L($env.PREFIX)/lib -ldl -lzstd -lgc -lgctba -lgccpp -lftxui-dom -lftxui-screen -pthread -Wl,--no-as-needed"
       }
 
       # jank's cmake/dependency/*.cmake files call add_subdirectory unconditionally with no
