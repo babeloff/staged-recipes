@@ -103,12 +103,14 @@ build:
       # inherits Phase 1's LINK_LIBRARIES via a generator expression; cmake can separate
       # the flag from its archive-path argument when processing the expanded list, so
       # -force_load silently becomes a no-op. -all_load is a global alternative that does
-      # not require flag-path adjacency. bdwgc (libgc) is already bundled in the merged
-      # archive, so do not add -lgc here or duplicate symbols may cause a link failure.
+      # not require flag-path adjacency.
+      # bdwgc (libgc) is the SYSTEM shared library (not bundled). The ar-merge script only
+      # captures object files from ar invocations; IMPORTED SHARED targets like bdwgc::gc
+      # are never passed to ar. Add -lgc explicitly so the final link resolves GC_malloc etc.
       let linker_flags = if ($env.HOST | str contains "darwin") {
-        $"-L($env.PREFIX)/lib -lzstd -Wl,-all_load"
+        $"-L($env.PREFIX)/lib -lzstd -lgc -Wl,-all_load"
       } else {
-        $"-L($env.PREFIX)/lib -ldl -lzstd -pthread -Wl,--no-as-needed"
+        $"-L($env.PREFIX)/lib -ldl -lzstd -lgc -pthread -Wl,--no-as-needed"
       }
 
       # jank's cmake/dependency/*.cmake files call add_subdirectory unconditionally with no
