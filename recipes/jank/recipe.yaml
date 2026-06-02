@@ -32,10 +32,12 @@ source:
   # - url: https://github.com/jank-lang/FTXUI/archive/daa421fa6ad97c8a6c9bd43f77c81862bfa52c77.tar.gz
   #   sha256: 8d7bc511eca464876001ed83e804a953297ecdb02afa377d1b49587e1c721ab0
   #   target_directory: compiler+runtime/third-party/ftxui
-  # https://prefix.dev/channels/conda-forge/packages/cpptrace >=1.0.4 — same stub approach
-  # - url: https://github.com/jank-lang/cpptrace/archive/ce639ebfcec47a7c74233b4bab50017cb34e615b.tar.gz
-  #   sha256: 3fa01f9c5ca84cc642a66ad30b5798dd031a4d0a2c2cd7581bf4d8b1aa206d26
-  #   target_directory: compiler+runtime/third-party/cpptrace
+  # cpptrace: must be bundled. conda-forge cpptrace 1.0.4 uses versioned inline namespaces
+  # (cpptrace::v1::stacktrace) which causes ambiguity with jank's forward declaration
+  # "struct stacktrace;" in the cpptrace namespace. The jank fork doesn't use versioned namespaces.
+  - url: https://github.com/jank-lang/cpptrace/archive/ce639ebfcec47a7c74233b4bab50017cb34e615b.tar.gz
+    sha256: 3fa01f9c5ca84cc642a66ad30b5798dd031a4d0a2c2cd7581bf4d8b1aa206d26
+    target_directory: compiler+runtime/third-party/cpptrace
   # https://prefix.dev/channels/conda-forge/packages/cppinterop — blocked: only LLVM 21 builds
   # exist on conda-forge; no clang22 variant available for cppinterop 1.9.0
   - url: https://github.com/jank-lang/CppInterOp/archive/8ce59d7aa4443098f2a6df4cb859732d9b6a76b0.tar.gz
@@ -113,11 +115,13 @@ build:
       # find_package fallback. Create stub CMakeLists.txt files so add_subdirectory succeeds
       # and redirects cmake to the system packages in the host environment.
       # (Must be single-line strings: multi-line literals at column 0 break the YAML block scalar.)
-      ^mkdir -p third-party/ftxui third-party/cpptrace third-party/boost-multiprecision third-party/bdwgc
+      # cpptrace is NOT stubbed: it is bundled from source (see sources section).
+      # The system cpptrace 1.0.4 uses versioned inline namespaces (cpptrace::v1::stacktrace)
+      # incompatible with jank's forward declarations.
+      ^mkdir -p third-party/ftxui third-party/boost-multiprecision third-party/bdwgc
       # IMPORTED targets from find_package inside add_subdirectory are directory-scoped by
       # default; set IMPORTED_GLOBAL TRUE so they are visible in the parent CMakeLists.txt.
       "cmake_minimum_required(VERSION 3.13)\nproject(ftxui-system)\nfind_package(ftxui REQUIRED)\nforeach(_t ftxui::screen ftxui::dom ftxui::component)\n  if(TARGET ${_t})\n    set_target_properties(${_t} PROPERTIES IMPORTED_GLOBAL TRUE)\n  endif()\nendforeach()\n" | save --force "third-party/ftxui/CMakeLists.txt"
-      "cmake_minimum_required(VERSION 3.13)\nproject(cpptrace-system)\nfind_package(cpptrace REQUIRED)\nif(TARGET cpptrace::cpptrace)\n  set_target_properties(cpptrace::cpptrace PROPERTIES IMPORTED_GLOBAL TRUE)\nendif()\n" | save --force "third-party/cpptrace/CMakeLists.txt"
       # CMP0167 NEW: use BoostConfig.cmake not the removed FindBoost module (cmake 4.x).
       # conda-forge libboost-headers ships only boost_headersConfig.cmake — there is no
       # boost_multiprecisionConfig.cmake.  Request COMPONENTS headers only, then create
@@ -166,7 +170,7 @@ requirements:
     - bdw-gc
     - libboost-devel
     - bzip2
-    - cpptrace >=1.0.4
+    # cpptrace is bundled: see source section note about versioned namespace incompatibility
     - doctest >=2.5.2
     - if: linux
       then: elfutils
