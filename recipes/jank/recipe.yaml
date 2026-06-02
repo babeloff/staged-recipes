@@ -168,11 +168,13 @@ requirements:
     - bzip2
     - cpptrace >=1.0.4
     - doctest >=2.5.2
-    - double-conversion
     - if: linux
       then: elfutils
     - fmt
-    - folly >=2026.05.25.00
+    # folly is NOT listed here: jank bundles its own forked folly_lib static archive
+    # and does not link against libfolly.so. Including the system folly package contaminates
+    # $PREFIX/include/folly/ with headers compiled for jemalloc, conflicting with
+    # jank's cmake flag FOLLY_ASSUME_NO_JEMALLOC=1 set for the bundled fork.
     - ftxui >=6.1.9
     - gmp
     - libatomic_ops
