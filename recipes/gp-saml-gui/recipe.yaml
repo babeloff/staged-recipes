@@ -1,15 +1,13 @@
 context:
-  version: "0.1"
-  # No releases — pinned to latest commit as of 2024-11-20
-  commit: "21cce40334791a533c7a263fe367f0ddc072d8fb"
+  version: "0.1.1"
 
 package:
   name: gp-saml-gui
   version: ${{ version }}
 
 source:
-  url: https://github.com/dlenski/gp-saml-gui/archive/${{ commit }}.tar.gz
-  sha256: 948e167ba375d03ac5871614601aee25d1afd1dbe28956e1af6e2ae6caa38a1b
+  url: https://github.com/babeloff/gp-saml-gui/archive/refs/tags/v${{ version }}.tar.gz
+  sha256: bccde504af0245699b091a22e051dc703bb54f077d2fcad2f4d71d32961b6ed6
 
 build:
   script: python -m pip install . -vv
@@ -42,7 +40,7 @@ tests:
       - test -f $PREFIX/bin/gp-saml-gui
 
 about:
-  homepage: https://github.com/dlenski/gp-saml-gui
+  homepage: https://github.com/babeloff/gp-saml-gui
   summary: Interactively authenticate to GlobalProtect VPNs that require SAML
   description: |
     gp-saml-gui opens a WebKit2GTK browser window to complete SAML
@@ -50,7 +48,7 @@ about:
     cookie and token needed by openconnect to establish the VPN tunnel.
   license: GPL-3.0-or-later
   license_file: LICENSE
-  repository: https://github.com/dlenski/gp-saml-gui
+  repository: https://github.com/babeloff/gp-saml-gui
 
 extra:
   recipe-maintainers:
