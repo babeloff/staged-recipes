@@ -1,0 +1,38 @@
+context:
+  version: "0.22.0"
+
+package:
+  name: mcp-inspector
+  version: ${{ version }}
+
+source:
+  url: https://github.com/modelcontextprotocol/inspector/archive/refs/tags/${{ version }}.tar.gz
+  sha256: 7df1298cd1a2e7cbb2c72d213f9c1f18a25d519f210f4f08f3936e3a64d1afbe
+
+build:
+  number: 0
+
+requirements:
+  host:
+    - nodejs >=22.7.5
+  run:
+    - nodejs >=22.7.5
+
+tests:
+  - script:
+      - mcp-inspector --help
+
+about:
+  homepage: https://github.com/modelcontextprotocol/inspector
+  summary: Interactive developer tool for testing and debugging MCP servers
+  description: |
+    MCP Inspector provides a web UI and CLI for connecting to Model Context
+    Protocol servers, inspecting their capabilities, and testing tools,
+    resources, and prompts interactively.
+  license: MIT
+  license_file: LICENSE
+  repository: https://github.com/modelcontextprotocol/inspector
+
+extra:
+  recipe-maintainers:
+    - phreed
