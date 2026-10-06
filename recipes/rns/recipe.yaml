@@ -1,0 +1,51 @@
+context:
+  version: "1.5.5"
+
+package:
+  name: rns
+  version: ${{ version }}
+
+source:
+  url: https://github.com/markqvist/Reticulum/releases/download/${{ version }}/rns-${{ version }}.tar.gz
+  sha256: 94f2352c7462e2fcf485d5c770eb2b41e666b753906ac3ce0a94e8a0c489a460
+
+build:
+  noarch: python
+  script: python -m pip install . -vv
+
+requirements:
+  host:
+    - python >=3.7
+    - pip
+    - setuptools
+  run:
+    - python >=3.7
+    - cryptography >=3.4.7
+    - pyserial >=3.5
+
+tests:
+  - python:
+      imports:
+        - RNS
+        - RNS.Cryptography
+      pip_check: true
+  - script:
+      - rnsd --help
+      - rnstatus --help
+
+about:
+  homepage: https://reticulum.network/
+  summary: Cryptography-based networking stack for resilient mesh networks
+  description: |
+    Reticulum is a cryptography-based networking stack for building local and
+    wide-area networks with readily available hardware. It can operate over
+    very high latency and extremely low bandwidth links, including LoRa,
+    packet radio, WiFi, Ethernet, serial, TCP, and UDP.
+  license: LicenseRef-Reticulum
+  license_file: LICENSE.txt
+  documentation: https://markqvist.github.io/Reticulum/manual/
+  repository: https://github.com/markqvist/Reticulum
+
+extra:
+  recipe-maintainers:
+    - phreed
