@@ -1,8 +1,8 @@
 Third-party code included in jank
 =================================
 
-The remaining vendored components are BDWGC (MIT-style), CppInterOp private
-headers and jank's adapted fork extensions (Apache-2.0 WITH LLVM-exception),
+The remaining vendored components are BDWGC (MIT-style), jank's adapted
+CppInterOp extensions and LLVM 23 workarounds (Apache-2.0 WITH LLVM-exception),
 Immer (BSL-1.0), isocline (MIT),
 nanobench (MIT), stduuid (MIT), and kuba--/zip (MIT).
 Their upstream license texts are included alongside this notice.

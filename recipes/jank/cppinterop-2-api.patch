@@ -1,14 +1,10 @@
 From: conda-forge maintainers
-Subject: [PATCH] Adapt jank's Clang facade to upstream CppInterOp 2.0.0
+Subject: [PATCH] Use CppInterOp 2.0 typed public reflection API and native Clang session.
 
-Keep fork-only reflection, overload diagnostics and interpreter setup in a
-jank-owned facade. Delegate equivalent operations to the packaged library,
-converting typed handles explicitly. Preserve array and reference semantics,
-function-template lookup, qualified constructor lookup, embedded PCH files,
-stale-PCH recovery and the large JIT code model.
-
-The private interpreter bridge requires the exact upstream 2.0.0 headers
-and matching LLVM headers. No forked CppInterOp library is built.
+Jank owns its compiler and obtains LLJIT through LLVM's public builder
+callback. Session-dependent operations use public Clang AST/Sema APIs;
+stateless reflection uses the packaged CppInterOp API. No private
+CppInterOp headers or interpreter layout are required.
 
 --- a/compiler+runtime/include/cpp/jank/analyze/cpp_util.hpp
 +++ b/compiler+runtime/include/cpp/jank/analyze/cpp_util.hpp
@@ -20,15 +16,6 @@ and matching LLVM headers. No forked CppInterOp library is built.
  
  #include <jtl/ptr.hpp>
  #include <jtl/result.hpp>
-@@ -20,7 +20,7 @@
- 
-   jtl::string_result<void> instantiate_if_needed(jtl::ptr<void> const scope);
-   jtl::string_result<jtl::ptr<void>>
--  instantiate(jtl::ptr<void> const scope, native_vector<Cpp::TemplateArgInfo> const &args);
-+  instantiate(jtl::ptr<void> const scope, native_vector<jank_cpp::TemplateArgInfo> const &args);
- 
-   jtl::ptr<void> resolve_type(jtl::immutable_string const &sym);
-   jtl::string_result<jtl::ptr<void>> resolve_scope(jtl::immutable_string const &sym);
 @@ -103,8 +103,8 @@
  
    usize offset_to_typed_object_base(jtl::ptr<void> type);
@@ -42,37 +29,46 @@ and matching LLVM headers. No forked CppInterOp library is built.
  
 --- a/compiler+runtime/include/cpp/jank/analyze/cppinterop.hpp
 +++ b/compiler+runtime/include/cpp/jank/analyze/cppinterop.hpp
-@@ -10,7 +10,7 @@
+@@ -9,12 +9,12 @@
+ #include <vector>
  
  #include <jtl/ptr.hpp>
++#include <CppInterOp/CppInterOp.h>
  
 -namespace CppImpl
++namespace jank::jit { class clang_interpreter; }
++
 +namespace jank_cpp
  {
-   struct TemplateArgInfo;
-   enum Operator : unsigned char;
-@@ -155,12 +155,12 @@
+-  struct TemplateArgInfo;
+-  enum Operator : unsigned char;
+-  enum OperatorArity : unsigned char;
+   struct OverloadCandidateInfo;
+ }
+ 
+@@ -155,27 +155,27 @@
    bool is_type_derived_from(clang_type derived, clang_type base);
    bool is_const_method(clang_decl method);
    std::string get_function_arg_name(clang_decl func, size_t param_index);
 -  void get_operator(CppImpl::Operator op,
-+  void get_operator(jank_cpp::Operator op,
++  void get_operator(Cpp::Operator op,
                      std::vector<clang_type> const &arg_types,
                      std::vector<clang_decl> &operators,
 -                    CppImpl::OperatorArity kind);
-+                    jank_cpp::OperatorArity kind);
++                    Cpp::OperatorArity kind);
    clang_type
 -  get_builtin_operator_type(CppImpl::Operator op, std::vector<clang_type> const &arg_types);
-+  get_builtin_operator_type(jank_cpp::Operator op, std::vector<clang_type> const &arg_types);
-   clang_decl create_interpreter(std::vector<char const *> const &args = {},
+-  clang_decl create_interpreter(std::vector<char const *> const &args = {},
++  get_builtin_operator_type(Cpp::Operator op, std::vector<clang_type> const &arg_types);
++  jit::clang_interpreter* create_interpreter(std::vector<char const *> const &args = {},
                                  std::vector<char const *> const &gpu_args = {},
                                  std::map<char const *, std::string_view> const &vfs = {},
-@@ -168,14 +168,14 @@
+                                 std::optional<int> const &cm = std::nullopt,
                                  bool *pch_out_of_date = nullptr);
    std::string detect_resource_dir(char const *clang_binary_name = "clang");
    clang_decl instantiate_template(clang_decl tmpl,
 -                                  CppImpl::TemplateArgInfo const *template_args,
-+                                  jank_cpp::TemplateArgInfo const *template_args,
++                                  Cpp::TemplateArgInfo const *template_args,
                                    size_t template_args_size,
                                    bool instantiate_body = false);
    bool instantiate_template(clang_decl spec);
@@ -86,7 +82,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
                                std::vector<clang_decl> const &arg_scopes);
 --- /dev/null
 +++ b/compiler+runtime/include/cpp/jank/analyze/cppinterop_extensions.hpp
-@@ -0,0 +1,429 @@
+@@ -0,0 +1,364 @@
 +//===--- CppInterOp.h - A layer for language interoperability ---*- C++ -*-===//
 +//
 +// Part of the compiler-research project, under the Apache License v2.0 with
@@ -115,6 +111,8 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +
 +#include <CppInterOp/CppInterOp.h>
 +
++namespace jank::jit { class clang_interpreter; }
++
 +namespace jank_cpp {
 +using TCppIndex_t = size_t;
 +using TCppScope_t = void*;
@@ -123,85 +121,18 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +using TCppFunction_t = void*;
 +using TCppConstFunction_t = const void*;
 +using TCppFuncAddr_t = void*;
-+using TInterp_t = void*;
 +using TCppObject_t = void*;
 +using TModule_t = void*;
 +
-+enum Operator : unsigned char {
-+  OP_None,
-+  OP_New,
-+  OP_Delete,
-+  OP_Array_New,
-+  OP_Array_Delete,
-+  OP_Plus,
-+  OP_Minus,
-+  OP_Star,
-+  OP_Slash,
-+  OP_Percent,
-+  OP_Caret,
-+  OP_Amp,
-+  OP_Pipe,
-+  OP_Tilde,
-+  OP_Exclaim,
-+  OP_Equal,
-+  OP_Less,
-+  OP_Greater,
-+  OP_PlusEqual,
-+  OP_MinusEqual,
-+  OP_StarEqual,
-+  OP_SlashEqual,
-+  OP_PercentEqual,
-+  OP_CaretEqual,
-+  OP_AmpEqual,
-+  OP_PipeEqual,
-+  OP_LessLess,
-+  OP_GreaterGreater,
-+  OP_LessLessEqual,
-+  OP_GreaterGreaterEqual,
-+  OP_EqualEqual,
-+  OP_ExclaimEqual,
-+  OP_LessEqual,
-+  OP_GreaterEqual,
-+  OP_Spaceship,
-+  OP_AmpAmp,
-+  OP_PipePipe,
-+  OP_PlusPlus,
-+  OP_MinusMinus,
-+  OP_Comma,
-+  OP_ArrowStar,
-+  OP_Arrow,
-+  OP_Call,
-+  OP_Subscript,
-+  OP_Conditional,
-+  OP_Coawait,
-+};
++using Cpp::Operator;
++using Cpp::OperatorArity;
++using Cpp::QualKind;
++using Cpp::ValueKind;
++using enum Cpp::Operator;
++using enum Cpp::OperatorArity;
++using enum Cpp::QualKind;
 +
-+enum OperatorArity : unsigned char { kUnary = 1, kBinary, kBoth };
-+
-+/// Enum modelling CVR qualifiers.
-+enum QualKind : unsigned char {
-+  Const = 1 << 0,
-+  Volatile = 1 << 1,
-+  Restrict = 1 << 2
-+};
-+
-+inline QualKind operator|(QualKind a, QualKind b) {
-+  return static_cast<QualKind>(static_cast<unsigned char>(a) |
-+                               static_cast<unsigned char>(b));
-+}
-+
-+enum class ValueKind : std::uint8_t {
-+  None,
-+  LValue,
-+  RValue,
-+};
-+
-+struct TemplateArgInfo {
-+  TCppType_t m_Type;
-+  const char* m_IntegralValue;
-+  TemplateArgInfo(TCppScope_t type, const char* integral_value = nullptr)
-+      : m_Type(type), m_IntegralValue(integral_value) {}
-+};
++using Cpp::TemplateArgInfo;
 +
 +enum class OverloadCandidateConversion : unsigned char {
 +  Invalid,
@@ -484,14 +415,14 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +GetBuiltinOperatorType(Operator op,
 +                       std::vector<TCppType_t> const& arg_types);
 +
-+TInterp_t
++jank::jit::clang_interpreter*
 +CreateInterpreter(const std::vector<const char*>& Args = {},
 +                  const std::vector<const char*>& GpuArgs = {},
 +                  const std::map<char const*, std::string_view>& VFS = {},
 +                  const std::optional<int>& CM = std::nullopt,
 +                  bool* PCHOutOfDate = nullptr);
 +
-+bool DeleteInterpreter(TInterp_t I = nullptr);
++
 +
 +std::string
 +DetectResourceDir(const char* ClangBinaryName = "clang");
@@ -527,17 +458,83 @@ and matching LLVM headers. No forked CppInterOp library is built.
      int op{};
      native_vector<expression_ref> arg_exprs;
      jtl::ptr<void> type{};
+--- /dev/null
++++ b/compiler+runtime/include/cpp/jank/jit/clang_interpreter.hpp
+@@ -0,0 +1,41 @@
++#pragma once
++
++#include <memory>
++#include <clang/AST/GlobalDecl.h>
++#include <clang/Frontend/CompilerInstance.h>
++#include <clang/Interpreter/Interpreter.h>
++#include <clang/Interpreter/Value.h>
++#include <clang/Sema/Sema.h>
++#include <llvm/ADT/StringSet.h>
++#include <llvm/ExecutionEngine/Orc/LLJIT.h>
++#include <llvm/IR/Module.h>
++
++namespace jank::jit
++{
++  // Own the native session. CppInterOp's public reflection handles refer to
++  // this session's AST; no CppInterOp interpreter implementation is accessed.
++  class clang_interpreter
++  {
++  public:
++    struct jit_state { llvm::orc::LLJIT* engine{}; };
++    clang_interpreter(std::unique_ptr<clang::Interpreter> native,
++                      std::shared_ptr<jit_state> state);
++    ~clang_interpreter();
++    clang::CompilerInstance const* getCI() const { return native->getCompilerInstance(); }
++    clang::CompilerInstance* getCI() { return native->getCompilerInstance(); }
++    clang::CompilerInstance* getCompilerInstance() { return getCI(); }
++    clang::Sema& getSema() { return getCI()->getSema(); }
++    llvm::orc::LLJIT* getExecutionEngine();
++    auto Parse(llvm::StringRef code) { return native->Parse(code); }
++    llvm::Error Execute(clang::PartialTranslationUnit& unit);
++    llvm::Error ParseAndExecute(llvm::StringRef code, clang::Value* value = nullptr);
++    auto getSymbolAddress(llvm::StringRef name) { return native->getSymbolAddress(name); }
++    auto getSymbolAddress(clang::GlobalDecl decl) { return native->getSymbolAddress(decl); }
++    void* getAddressOfGlobal(clang::GlobalDecl decl);
++    operator clang::Interpreter&() { return *native; }
++  private:
++    std::unique_ptr<clang::Interpreter> native;
++    std::shared_ptr<jit_state> state;
++    llvm::StringSet<> defined_tls;
++  };
++}
+--- a/compiler+runtime/include/cpp/jank/jit/processor.hpp
++++ b/compiler+runtime/include/cpp/jank/jit/processor.hpp
+@@ -29,9 +29,9 @@
+   class DiagnosticConsumer;
+ }
+ 
+-namespace CppInternal
++namespace jank::jit
+ {
+-  class Interpreter;
++  class clang_interpreter;
+ }
+ 
+ namespace jank::ir
+@@ -100,6 +100,6 @@
+ 
+     /* This mutex is used for everything Clang/LLVM related, including CppInterOp work. Anything
+      * accessing mutable state in the Clang/LLVM JIT runtime needs to go through this. */
+-    folly::Synchronized<jtl::ptr<CppInternal::Interpreter>, std::recursive_mutex> interpreter;
++    folly::Synchronized<jtl::ptr<jank::jit::clang_interpreter>, std::recursive_mutex> interpreter;
+   };
+ }
 --- a/compiler+runtime/src/cpp/jank/analyze/cpp_util.cpp
 +++ b/compiler+runtime/src/cpp/jank/analyze/cpp_util.cpp
-@@ -81,7 +81,7 @@
-   }
+@@ -1,7 +1,7 @@
+ #include <algorithm>
  
-   jtl::string_result<jtl::ptr<void>>
--  instantiate(jtl::ptr<void> const scope, native_vector<Cpp::TemplateArgInfo> const &args)
-+  instantiate(jtl::ptr<void> const scope, native_vector<jank_cpp::TemplateArgInfo> const &args)
-   {
-     auto const locked_interpreter{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
-     auto &diag{ (*locked_interpreter)->getCompilerInstance()->getDiagnostics() };
+ #include <clang/Sema/Sema.h>
+-#include <CppInterOp/Compatibility.h>
++#include <jank/jit/clang_interpreter.hpp>
+ 
+ #include <jank/analyze/cpp_util.hpp>
+ #include <jank/analyze/visit.hpp>
 @@ -1230,7 +1230,7 @@
      {
        jtl::ptr<void> fn;
@@ -568,12 +565,8 @@ and matching LLVM headers. No forked CppInterOp library is built.
              break;
          }
        }
-@@ -1640,10 +1640,10 @@
-     static auto const convert_template{ cppinterop::get_scope_from_complete_name(
-       "jank::runtime::convert") };
-     auto const locked_interpreter{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
--    Cpp::TemplateArgInfo const arg{ cppinterop::get_canonical_type(
-+    jank_cpp::TemplateArgInfo const arg{ cppinterop::get_canonical_type(
+@@ -1643,7 +1643,7 @@
+     Cpp::TemplateArgInfo const arg{ cppinterop::get_canonical_type(
        cppinterop::get_type_without_cv(cppinterop::get_non_reference_type(type))) };
      clang::Sema::SFINAETrap const trap{ (*locked_interpreter)->getSema(), true };
 -    Cpp::TCppScope_t instantiation{};
@@ -581,13 +574,10 @@ and matching LLVM headers. No forked CppInterOp library is built.
      {
        auto &diag{ (*locked_interpreter)->getCompilerInstance()->getDiagnostics() };
        auto old_client{ diag.takeClient() };
-@@ -1667,46 +1667,46 @@
-     return offset;
-   }
- 
--  jtl::option<Cpp::Operator> match_operator(jtl::immutable_string const &name)
--  {
--    static native_unordered_map<jtl::immutable_string, Cpp::Operator> const operators{
+@@ -1670,43 +1670,43 @@
+   jtl::option<Cpp::Operator> match_operator(jtl::immutable_string const &name)
+   {
+     static native_unordered_map<jtl::immutable_string, Cpp::Operator> const operators{
 -      {    "+",                Cpp::OP_Plus },
 -      {    "-",               Cpp::OP_Minus },
 -      {    "*",                Cpp::OP_Star },
@@ -623,9 +613,6 @@ and matching LLVM headers. No forked CppInterOp library is built.
 -      {  "<<=",       Cpp::OP_LessLessEqual },
 -      {  ">>=", Cpp::OP_GreaterGreaterEqual },
 -      { "aget",           Cpp::OP_Subscript },
-+  jtl::option<jank_cpp::Operator> match_operator(jtl::immutable_string const &name)
-+  {
-+    static native_unordered_map<jtl::immutable_string, jank_cpp::Operator> const operators{
 +      {    "+",                jank_cpp::OP_Plus },
 +      {    "-",               jank_cpp::OP_Minus },
 +      {    "*",                jank_cpp::OP_Star },
@@ -667,13 +654,10 @@ and matching LLVM headers. No forked CppInterOp library is built.
      };
  
      auto const op{ operators.find(name) };
-@@ -1717,45 +1717,45 @@
-     return none;
-   }
- 
--  jtl::option<jtl::immutable_string> operator_name(Cpp::Operator const op)
--  {
--    static native_unordered_map<Cpp::Operator, jtl::immutable_string> const operators{
+@@ -1720,42 +1720,42 @@
+   jtl::option<jtl::immutable_string> operator_name(Cpp::Operator const op)
+   {
+     static native_unordered_map<Cpp::Operator, jtl::immutable_string> const operators{
 -      {                Cpp::OP_Plus,    "+" },
 -      {               Cpp::OP_Minus,    "-" },
 -      {                Cpp::OP_Star,    "*" },
@@ -710,9 +694,6 @@ and matching LLVM headers. No forked CppInterOp library is built.
 -      { Cpp::OP_GreaterGreaterEqual,  ">>=" },
 -      {           Cpp::OP_Subscript, "aget" },
 -      {                Cpp::OP_Call,   "()" }
-+  jtl::option<jtl::immutable_string> operator_name(jank_cpp::Operator const op)
-+  {
-+    static native_unordered_map<jank_cpp::Operator, jtl::immutable_string> const operators{
 +      {                jank_cpp::OP_Plus,    "+" },
 +      {               jank_cpp::OP_Minus,    "-" },
 +      {                jank_cpp::OP_Star,    "*" },
@@ -777,7 +758,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
      }
  
      std::vector<clang_decl> from_voidp(std::vector<void *> const &handles)
-@@ -37,361 +40,361 @@
+@@ -37,7 +40,7 @@
    std::string mangle_rtti(clang_type type)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
@@ -786,31 +767,26 @@ and matching LLVM headers. No forked CppInterOp library is built.
    }
  
    void enable_debug_output(bool value)
-   {
-     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
--    Cpp::EnableDebugOutput(value);
-+    jank_cpp::EnableDebugOutput(value);
-   }
- 
+@@ -49,349 +52,349 @@
    void dump(clang_decl scope)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    Cpp::DumpScope(scope);
-+    jank_cpp::DumpScope(scope);
++    Cpp::DumpScope(Cpp::ConstDeclRef(scope.data));
    }
  
    bool is_namespace(clang_decl scope)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsNamespace(scope);
-+    return jank_cpp::IsNamespace(scope);
++    return Cpp::IsNamespace(Cpp::ConstDeclRef(scope.data));
    }
  
    bool is_class(clang_decl scope)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsClass(scope);
-+    return jank_cpp::IsClass(scope);
++    return Cpp::IsClass(Cpp::ConstDeclRef(scope.data));
    }
  
    bool is_class_template(clang_decl handle)
@@ -824,14 +800,14 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsFunction(scope);
-+    return jank_cpp::IsFunction(scope);
++    return Cpp::IsFunction(Cpp::ConstDeclRef(scope.data));
    }
  
    bool is_function_pointer_type(clang_type type)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsFunctionPointerType(type);
-+    return jank_cpp::IsFunctionPointerType(type);
++    return Cpp::IsFunctionPointerType(Cpp::ConstTypeRef(type.data));
    }
  
    bool is_inline_friend_function(clang_decl scope)
@@ -852,7 +828,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsBuiltin(type);
-+    return jank_cpp::IsBuiltin(type);
++    return Cpp::IsBuiltin(Cpp::ConstTypeRef(type.data));
    }
  
    bool is_integral(clang_type type)
@@ -880,14 +856,14 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsTemplate(handle);
-+    return jank_cpp::IsTemplate(handle);
++    return Cpp::IsTemplate(Cpp::ConstDeclRef(handle.data));
    }
  
    bool is_template_specialization(clang_decl handle)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsTemplateSpecialization(handle);
-+    return jank_cpp::IsTemplateSpecialization(handle);
++    return Cpp::IsTemplateSpecialization(Cpp::ConstDeclRef(handle.data));
    }
  
    bool is_template_specialization_of(clang_decl spec, clang_decl templ)
@@ -901,7 +877,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsTypedefed(handle);
-+    return jank_cpp::IsTypedefed(handle);
++    return Cpp::IsTypedefed(Cpp::ConstDeclRef(handle.data));
    }
  
    clang_type get_common_type(clang_type lhs, clang_type rhs)
@@ -943,21 +919,21 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsEnumScope(handle);
-+    return jank_cpp::IsEnumScope(handle);
++    return Cpp::IsEnumScope(Cpp::ConstDeclRef(handle.data));
    }
  
    bool is_enum_constant(clang_decl handle)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsEnumConstant(handle);
-+    return jank_cpp::IsEnumConstant(handle);
++    return Cpp::IsEnumConstant(Cpp::ConstDeclRef(handle.data));
    }
  
    bool is_enum_type(clang_type type)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsEnumType(type);
-+    return jank_cpp::IsEnumType(type);
++    return Cpp::IsEnumType(Cpp::ConstTypeRef(type.data));
    }
  
    bool has_type_qualifier(clang_type type, qualifier q)
@@ -971,21 +947,21 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsVariable(scope);
-+    return jank_cpp::IsVariable(scope);
++    return Cpp::IsVariable(Cpp::ConstDeclRef(scope.data));
    }
  
    std::string get_name(clang_decl klass)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::GetName(klass);
-+    return jank_cpp::GetName(klass);
++    return Cpp::GetName(Cpp::ConstDeclRef(klass.data));
    }
  
    std::string get_qualified_name(clang_decl klass)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::GetQualifiedName(klass);
-+    return jank_cpp::GetQualifiedName(klass);
++    return Cpp::GetQualifiedName(Cpp::ConstDeclRef(klass.data));
    }
  
    std::string get_qualified_complete_name(clang_decl klass)
@@ -1041,7 +1017,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::GetParentScope(scope);
-+    return jank_cpp::GetParentScope(scope);
++    return Cpp::GetParentScope(Cpp::ConstDeclRef(scope.data)) .data;
    }
  
    clang_decl get_scope_from_type(clang_type type)
@@ -1104,21 +1080,21 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::GetFunctionNumArgs(func);
-+    return jank_cpp::GetFunctionNumArgs(func);
++    return Cpp::GetFunctionNumArgs(Cpp::ConstFuncRef(func.data));
    }
  
    size_t get_function_required_args(clang_decl func)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::GetFunctionRequiredArgs(func);
-+    return jank_cpp::GetFunctionRequiredArgs(func);
++    return Cpp::GetFunctionRequiredArgs(Cpp::ConstFuncRef(func.data));
    }
  
    clang_type get_function_arg_type(clang_decl func, size_t iarg)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::GetFunctionArgType(func, iarg);
-+    return jank_cpp::GetFunctionArgType(func, iarg);
++    return Cpp::GetFunctionArgType(Cpp::ConstFuncRef(func.data), iarg) .data;
    }
  
    std::string get_function_signature(clang_type func)
@@ -1174,7 +1150,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsFunctionDeleted(function);
-+    return jank_cpp::IsFunctionDeleted(function);
++    return Cpp::IsFunctionDeleted(Cpp::ConstFuncRef(function.data));
    }
  
    bool is_function_type_const(clang_type function_type)
@@ -1188,7 +1164,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsTemplatedFunction(func);
-+    return jank_cpp::IsTemplatedFunction(func);
++    return Cpp::IsTemplatedFunction(Cpp::ConstFuncRef(func.data));
    }
  
    bool is_bodyless_function_template_specialization(clang_decl func)
@@ -1212,42 +1188,42 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsMethod(method);
-+    return jank_cpp::IsMethod(method);
++    return Cpp::IsMethod(Cpp::ConstFuncRef(method.data));
    }
  
    bool is_protected_method(clang_decl method)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsProtectedMethod(method);
-+    return jank_cpp::IsProtectedMethod(method);
++    return Cpp::IsProtectedMethod(Cpp::ConstFuncRef(method.data));
    }
  
    bool is_private_method(clang_decl method)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsPrivateMethod(method);
-+    return jank_cpp::IsPrivateMethod(method);
++    return Cpp::IsPrivateMethod(Cpp::ConstFuncRef(method.data));
    }
  
    bool is_constructor(clang_decl method)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsConstructor(method);
-+    return jank_cpp::IsConstructor(method);
++    return Cpp::IsConstructor(Cpp::ConstFuncRef(method.data));
    }
  
    bool is_destructor(clang_decl method)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsDestructor(method);
-+    return jank_cpp::IsDestructor(method);
++    return Cpp::IsDestructor(Cpp::ConstFuncRef(method.data));
    }
  
    bool is_static_method(clang_decl method)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsStaticMethod(method);
-+    return jank_cpp::IsStaticMethod(method);
++    return Cpp::IsStaticMethod(Cpp::ConstFuncRef(method.data));
    }
  
    void get_datamembers(clang_decl scope, std::vector<clang_decl> &datamembers)
@@ -1259,7 +1235,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
      datamembers = from_voidp(cpp_datamembers);
    }
  
-@@ -451,308 +454,308 @@
+@@ -451,318 +454,318 @@
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
      std::vector<void *> cpp_datamembers;
@@ -1293,21 +1269,21 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsProtectedVariable(var);
-+    return jank_cpp::IsProtectedVariable(var);
++    return Cpp::IsProtectedVariable(Cpp::ConstDeclRef(var.data));
    }
  
    bool is_private_variable(clang_decl var)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsPrivateVariable(var);
-+    return jank_cpp::IsPrivateVariable(var);
++    return Cpp::IsPrivateVariable(Cpp::ConstDeclRef(var.data));
    }
  
    bool is_static_variable(clang_decl var)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsStaticVariable(var);
-+    return jank_cpp::IsStaticVariable(var);
++    return Cpp::IsStaticVariable(Cpp::ConstDeclRef(var.data));
    }
  
    bool is_non_static_variable(clang_decl scope)
@@ -1328,7 +1304,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsPointerType(type);
-+    return jank_cpp::IsPointerType(type);
++    return Cpp::IsPointerType(Cpp::ConstTypeRef(type.data));
    }
  
    bool is_pointer_to_member_type(clang_type type)
@@ -1454,7 +1430,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsReferenceType(type);
-+    return jank_cpp::IsReferenceType(type);
++    return Cpp::IsReferenceType(Cpp::ConstTypeRef(type.data));
    }
  
    bool is_rvalue_reference_type(clang_type type)
@@ -1559,7 +1535,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::GetCanonicalType(type);
-+    return jank_cpp::GetCanonicalType(type);
++    return Cpp::GetCanonicalType(Cpp::ConstTypeRef(type.data)) .data;
    }
  
    clang_type get_type(std::string const &type)
@@ -1587,7 +1563,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::IsConstMethod(method);
-+    return jank_cpp::IsConstMethod(method);
++    return Cpp::IsConstMethod(Cpp::ConstFuncRef(method.data));
    }
  
    std::string get_function_arg_name(clang_decl func, size_t param_index)
@@ -1597,14 +1573,14 @@ and matching LLVM headers. No forked CppInterOp library is built.
 -  }
 -
 -  void get_operator(CppImpl::Operator op,
-+    return jank_cpp::GetFunctionArgName(func, param_index);
++    return Cpp::GetFunctionArgName(Cpp::ConstFuncRef(func.data), param_index);
 +  }
 +
-+  void get_operator(jank_cpp::Operator op,
++  void get_operator(Cpp::Operator op,
                      std::vector<clang_type> const &arg_types,
                      std::vector<clang_decl> &operators,
 -                    CppImpl::OperatorArity kind)
-+                    jank_cpp::OperatorArity kind)
++                    Cpp::OperatorArity kind)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
      std::vector<void *> cpp_operators;
@@ -1618,14 +1594,19 @@ and matching LLVM headers. No forked CppInterOp library is built.
 -  {
 -    auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 -    return Cpp::GetBuiltinOperatorType(op, to_voidp(arg_types));
-+  get_builtin_operator_type(jank_cpp::Operator op, std::vector<clang_type> const &arg_types)
+-  }
+-
+-  clang_decl create_interpreter(std::vector<char const *> const &args,
++  get_builtin_operator_type(Cpp::Operator op, std::vector<clang_type> const &arg_types)
 +  {
 +    auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
 +    return jank_cpp::GetBuiltinOperatorType(op, to_voidp(arg_types));
-   }
- 
-   clang_decl create_interpreter(std::vector<char const *> const &args,
-@@ -762,29 +765,29 @@
++  }
++
++  jit::clang_interpreter* create_interpreter(std::vector<char const *> const &args,
+                                 std::vector<char const *> const &gpu_args,
+                                 std::map<char const *, std::string_view> const &vfs,
+                                 std::optional<int> const &cm,
                                  bool *pch_out_of_date)
    {
      auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
@@ -1634,16 +1615,12 @@ and matching LLVM headers. No forked CppInterOp library is built.
    }
  
    // Deliberately unlocked: this only spawns an external clang process and touches no Sema or
-   // ASTContext state, so it should not block interpreter work on other threads.
-   std::string detect_resource_dir(char const *clang_binary_name)
-   {
--    return Cpp::DetectResourceDir(clang_binary_name);
-+    return jank_cpp::DetectResourceDir(clang_binary_name);
+@@ -773,18 +776,18 @@
    }
  
    clang_decl instantiate_template(clang_decl tmpl,
 -                                  CppImpl::TemplateArgInfo const *template_args,
-+                                  jank_cpp::TemplateArgInfo const *template_args,
++                                  Cpp::TemplateArgInfo const *template_args,
                                    size_t template_args_size,
                                    bool instantiate_body)
    {
@@ -1683,7 +1660,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
  }
 --- /dev/null
 +++ b/compiler+runtime/src/cpp/jank/analyze/cppinterop_extensions.cpp
-@@ -0,0 +1,2882 @@
+@@ -0,0 +1,3101 @@
 +//--------------------------------------------------------------------*- C++ -*-
 +// CLING - the C++ LLVM-based InterpreterG :)
 +// author:  Vassil Vassilev <vvasilev@cern.ch>
@@ -1694,7 +1671,8 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +//------------------------------------------------------------------------------
 +
 +#include <jank/analyze/cppinterop_extensions.hpp>
-+#include <CppInterOp/Compatibility.h>
++#include <jank/jit/clang_interpreter.hpp>
++#include <llvm/Support/TargetSelect.h>
 +#include <clang/Basic/DiagnosticSerialization.h>
 +#include <llvm/Support/DynamicLibrary.h>
 +
@@ -1795,13 +1773,34 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +namespace jank_cpp {
 +using namespace clang;
 +using namespace llvm;
-+static compat::Interpreter& getInterp() {
-+  auto handle = Cpp::GetInterpreter();
-+  assert(handle && "CppInterOp interpreter must be initialized");
-+  return *static_cast<compat::Interpreter*>(handle.data);
++static llvm::ManagedStatic<std::unique_ptr<jank::jit::clang_interpreter>> owned_interpreter;
++static jank::jit::clang_interpreter& getInterp() {
++  assert(*owned_interpreter && "jank interpreter must be initialized");
++  return **owned_interpreter;
 +}
 +static clang::Sema& getSema() { return getInterp().getCI()->getSema(); }
 +static clang::ASTContext& getASTContext() { return getSema().getASTContext(); }
++// Resolve names in the same native Clang session that owns jank's AST.
++static void lookupNamed(Sema& S, LookupResult& R, DeclContext* within) {
++  R.suppressDiagnostics();
++  if(within) {
++    if(auto* tag = llvm::dyn_cast<TagDecl>(within)) {
++      within = llvm::dyn_cast_or_null<DeclContext>(tag->getDefinition());
++      if(!within) return;
++    } else within = within->getPrimaryContext();
++    S.LookupQualifiedName(R, within);
++  } else S.LookupName(R, S.TUScope);
++}
++static NamedDecl* lookupNamed(std::string const& name, DeclContext* within) {
++  auto& S = getSema();
++  LookupResult result(S, &getASTContext().Idents.get(name), SourceLocation(), Sema::LookupOrdinaryName);
++  lookupNamed(S, result, within);
++  result.resolveKind();
++  if(!result.isSingleResult()) return nullptr;
++  return result.getFoundDecl();
++}
++TCppScope_t GetScope(const std::string& name, TCppScope_t parent);
++
 +template <class Ref> std::vector<Ref> box(std::vector<void*> const& values) {
 +  std::vector<Ref> result;
 +  result.reserve(values.size());
@@ -1814,7 +1813,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +  for (auto value : values) result.emplace_back(value.data);
 +  return result;
 +}
-+static void ForceCodeGen(Decl* D, compat::Interpreter& I);
++static void ForceCodeGen(Decl* D, jank::jit::clang_interpreter& I);
 +std::string MangleRTTI(TCppType_t type);
 +static void InstantiateFunctionDefinition(Decl* D);
 +bool IsClassTemplate(TCppScope_t scope);
@@ -1865,7 +1864,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +                         const std::vector<TCppScope_t>& arg_scopes);
 +std::vector<TCppFunction_t> LookupMethods(const std::string& name,
 +                                          TCppScope_t parent);
-+intptr_t GetVariableOffset(compat::Interpreter& I, Decl* D,
++intptr_t GetVariableOffset(jank::jit::clang_interpreter& I, Decl* D,
 +                           CXXRecordDecl* BaseCXXRD);
 +intptr_t GetVariableOffset(TCppScope_t var, TCppScope_t parent);
 +bool IsNonStaticVariable(TCppScope_t var);
@@ -1907,7 +1906,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +Decl* InstantiateTemplate(TemplateDecl* TemplateD,
 +                          ArrayRef<TemplateArgument> TemplateArgs, Sema& S,
 +                          bool instantiate_body);
-+TCppScope_t InstantiateTemplate(compat::Interpreter& I, TCppScope_t tmpl,
++TCppScope_t InstantiateTemplate(jank::jit::clang_interpreter& I, TCppScope_t tmpl,
 +                                const TemplateArgInfo* template_args,
 +                                size_t template_args_size,
 +                                bool instantiate_body);
@@ -1988,7 +1987,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +
 +  DiagnosticTextConsumer Consumer;
 +};
-+static void ForceCodeGen(Decl* D, compat::Interpreter& I) {
++static void ForceCodeGen(Decl* D, jank::jit::clang_interpreter& I) {
 +  // The decl was deferred by CodeGen. Force its emission.
 +  // FIXME: In ASTContext::DeclMustBeEmitted we should check if the
 +  // Decl::isUsed is set or we should be able to access CodeGen's
@@ -2038,7 +2037,6 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +}
 +
 +static void InstantiateFunctionDefinition(Decl* D) {
-+  compat::SynthesizingCodeRAII RAII(&getInterp());
 +  if (auto* FD = llvm::dyn_cast_or_null<FunctionDecl>(D)) {
 +    getSema().InstantiateFunctionDefinition(SourceLocation(), FD,
 +                                            /*Recursive=*/true,
@@ -3000,7 +2998,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +  return results;
 +}
 +
-+intptr_t GetVariableOffset(compat::Interpreter& I, Decl* D,
++intptr_t GetVariableOffset(jank::jit::clang_interpreter& I, Decl* D,
 +                           CXXRecordDecl* BaseCXXRD) {
 +  if (!D)
 +    return 0;
@@ -3071,7 +3069,11 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +  if (auto* VD = llvm::dyn_cast<VarDecl>(D)) {
 +    auto GD = GlobalDecl(VD);
 +    std::string mangledName;
-+    compat::maybeMangleDeclName(GD, mangledName);
++    auto context = std::unique_ptr<MangleContext>(C.createMangleContext());
++    if(context->shouldMangleDeclName(VD)) {
++      llvm::raw_string_ostream output(mangledName);
++      context->mangleName(GD, output);
++    } else mangledName = VD->getNameAsString();
 +    void* address = llvm::sys::DynamicLibrary::SearchForAddressOfSymbol(
 +        mangledName.c_str());
 +
@@ -3079,8 +3081,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +      address = I.getAddressOfGlobal(GD);
 +    if (!address) {
 +      if (!VD->hasInit()) {
-+        compat::SynthesizingCodeRAII RAII(&getInterp());
-+        getSema().InstantiateVariableDefinition(SourceLocation(), VD);
++              getSema().InstantiateVariableDefinition(SourceLocation(), VD);
 +        VD = VD->getDefinition();
 +      }
 +      if (VD->hasInit() &&
@@ -3097,13 +3098,13 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +      if (isDiscardableGVALinkage(Linkage))
 +        ForceCodeGen(VD, I);
 +    }
-+    auto VDAorErr = compat::getSymbolAddress(I, StringRef(mangledName));
++    auto VDAorErr = I.getSymbolAddress(StringRef(mangledName));
 +    if (!VDAorErr) {
 +      llvm::logAllUnhandledErrors(VDAorErr.takeError(), llvm::errs(),
 +                                  "Failed to GetVariableOffset:");
 +      return 0;
 +    }
-+    return (intptr_t)jitTargetAddressToPointer<void*>(VDAorErr.get());
++    return (intptr_t)VDAorErr->toPtr<void*>();
 +  }
 +
 +  return 0;
@@ -3738,7 +3739,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +  return InstantiateTemplate(TemplateD, TLI, S, instantiate_body);
 +}
 +
-+TCppScope_t InstantiateTemplate(compat::Interpreter& I, TCppScope_t tmpl,
++TCppScope_t InstantiateTemplate(jank::jit::clang_interpreter& I, TCppScope_t tmpl,
 +                                const TemplateArgInfo* template_args,
 +                                size_t template_args_size,
 +                                bool instantiate_body) {
@@ -3751,7 +3752,6 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +  }
 +
 +  // We will create a new decl, push a transaction.
-+  compat::SynthesizingCodeRAII RAII(&getInterp());
 +  return InstantiateTemplate(TemplateD, TemplateArgs, S, instantiate_body);
 +}
 +
@@ -4117,7 +4117,16 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +}
 +
 +TCppScope_t GetBaseClass(TCppScope_t klass, TCppIndex_t ibase) {
-+  return Cpp::GetBaseClass(Cpp::ConstDeclRef(klass), ibase) .data;
++  auto* D = (Decl*)klass;
++  auto* CXXRD = llvm::dyn_cast_or_null<CXXRecordDecl>(D);
++  if (!CXXRD || CXXRD->getNumBases() <= ibase)
++    return 0;
++
++  auto type = (CXXRD->bases_begin() + ibase)->getType();
++  if (auto RT = type->getAs<RecordType>())
++    return (TCppScope_t)RT->getDecl()->getCanonicalDecl();
++
++  return 0;
 +}
 +
 +TCppType_t GetCanonicalType(TCppType_t type) {
@@ -4125,9 +4134,45 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +}
 +
 +void GetDatamembers(TCppScope_t scope, std::vector<TCppScope_t>& datamembers) {
-+  std::vector<Cpp::DeclRef> datamembers_refs;
-+  Cpp::GetDatamembers(Cpp::DeclRef(scope), datamembers_refs);
-+  datamembers = unbox(datamembers_refs);
++  auto* D = (Decl*)scope;
++
++  if (auto* CXXRD = llvm::dyn_cast_or_null<CXXRecordDecl>(D)) {
++    getSema().ForceDeclarationOfImplicitMembers(CXXRD);
++    if (CXXRD->hasDefinition())
++      CXXRD = CXXRD->getDefinition();
++
++    llvm::SmallVector<RecordDecl::decl_iterator, 2> stack_begin;
++    llvm::SmallVector<RecordDecl::decl_iterator, 2> stack_end;
++    stack_begin.push_back(CXXRD->decls_begin());
++    stack_end.push_back(CXXRD->decls_end());
++    while (!stack_begin.empty()) {
++      if (stack_begin.back() == stack_end.back()) {
++        stack_begin.pop_back();
++        stack_end.pop_back();
++        continue;
++      }
++      Decl* D = *(stack_begin.back());
++      if (auto* FD = llvm::dyn_cast<FieldDecl>(D)) {
++        if (FD->isAnonymousStructOrUnion()) {
++          if (const auto* RT = FD->getType()->getAs<RecordType>()) {
++            if (auto* CXXRD =
++                    llvm::dyn_cast<CXXRecordDecl>(RT->getOriginalDecl())) {
++              stack_begin.back()++;
++              stack_begin.push_back(CXXRD->decls_begin());
++              stack_end.push_back(CXXRD->decls_end());
++              continue;
++            }
++          }
++        }
++        datamembers.push_back((TCppScope_t)D);
++
++      } else if (auto* USD = llvm::dyn_cast<UsingShadowDecl>(D)) {
++        if (llvm::isa<FieldDecl>(USD->getTargetDecl()))
++          datamembers.push_back(USD);
++      }
++      stack_begin.back()++;
++    }
++  }
 +}
 +
 +std::string GetFunctionArgName(TCppFunction_t func, TCppIndex_t param_index) {
@@ -4174,7 +4219,30 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +}
 +
 +std::string GetFunctionSignature(TCppFunction_t func) {
-+  return Cpp::GetFunctionSignature(Cpp::ConstFuncRef(func));
++  if (!func)
++    return "<unknown>";
++
++  auto* D = (clang::Decl*)func;
++  clang::FunctionDecl* FD;
++
++  if (llvm::dyn_cast<FunctionDecl>(D))
++    FD = llvm::dyn_cast<FunctionDecl>(D);
++  else if (auto* FTD = llvm::dyn_cast<clang::FunctionTemplateDecl>(D))
++    FD = FTD->getTemplatedDecl();
++  else
++    return "<unknown>";
++
++  std::string Signature;
++  raw_string_ostream SS(Signature);
++  PrintingPolicy Policy = getASTContext().getPrintingPolicy();
++  // Skip printing the body
++  Policy.TerseOutput = true;
++  Policy.FullyQualifiedName = true;
++  Policy.SuppressDefaultTemplateArgs = false;
++  Policy.PolishForDeclaration = true;
++  FD->print(SS, Policy);
++  SS.flush();
++  return Signature;
 +}
 +
 +std::vector<TCppFunction_t> GetFunctionsUsingName(TCppScope_t scope,
@@ -4198,7 +4266,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +  clang::LookupResult R(S, DName, SourceLocation(), Sema::LookupOrdinaryName,
 +                        RedeclarationKind::ForVisibleRedeclaration);
 +
-+  CppInternal::utils::Lookup::Named(&S, R, Decl::castToDeclContext(D));
++  lookupNamed(S, R, Decl::castToDeclContext(D));
 +
 +  if (R.empty())
 +    return funcs;
@@ -4214,7 +4282,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +}
 +
 +TCppScope_t GetGlobalScope() {
-+  return Cpp::GetGlobalScope() .data;
++  return getSema().getASTContext().getTranslationUnitDecl()->getFirstDecl();
 +}
 +
 +std::string GetName(TCppType_t klass) {
@@ -4223,7 +4291,22 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +
 +TCppScope_t GetNamed(const std::string& name,
 +                     TCppScope_t parent /*= nullptr*/) {
-+  return Cpp::GetNamed(name, Cpp::ConstDeclRef(parent)) .data;
++  clang::DeclContext* Within = 0;
++  if (parent) {
++    auto* D = (clang::Decl*)parent;
++    D = GetUnderlyingScope(D);
++    Within = llvm::dyn_cast<clang::DeclContext>(D);
++  }
++#ifdef CPPINTEROP_USE_CLING
++  if (Within)
++    Within->getPrimaryContext()->buildLookup();
++#endif
++  auto* ND = lookupNamed(name, Within);
++  if (ND && ND != (clang::NamedDecl*)-1) {
++    return (TCppScope_t)(ND->getCanonicalDecl());
++  }
++
++  return 0;
 +}
 +
 +TCppType_t GetNonReferenceType(TCppType_t type) {
@@ -4234,7 +4317,19 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +}
 +
 +TCppIndex_t GetNumBases(TCppScope_t klass) {
-+  return Cpp::GetNumBases(Cpp::ConstDeclRef(klass));
++  auto* D = (Decl*)klass;
++
++  if (auto* CTSD = llvm::dyn_cast_or_null<ClassTemplateSpecializationDecl>(D))
++    if (!CTSD->hasDefinition())
++      getSema().InstantiateClassTemplateSpecialization(
++          SourceLocation::getFromRawEncoding(1), CTSD,
++          TSK_ExplicitInstantiationDefinition, true, false);
++  if (auto* CXXRD = llvm::dyn_cast_or_null<CXXRecordDecl>(D)) {
++    if (CXXRD->hasDefinition())
++      return CXXRD->getNumBases();
++  }
++
++  return 0;
 +}
 +
 +TCppScope_t GetParentScope(TCppScope_t scope) {
@@ -4251,11 +4346,35 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +}
 +
 +TCppType_t GetPointerType(TCppType_t type) {
-+  return Cpp::GetPointerType(Cpp::ConstTypeRef(type)) .data;
++  QualType QT = QualType::getFromOpaquePtr(type);
++  QualType PointerTy = getASTContext().getPointerType(QT);
++  return PointerTy.getAsOpaquePtr();
 +}
 +
 +std::string GetQualifiedCompleteName(TCppType_t klass) {
-+  return Cpp::GetQualifiedCompleteName(Cpp::ConstDeclRef(klass));
++  auto& C = getSema().getASTContext();
++  auto* D = (Decl*)klass;
++
++  if (auto* ND = llvm::dyn_cast_or_null<NamedDecl>(D)) {
++    if (auto* TD = llvm::dyn_cast<TagDecl>(ND)) {
++      std::string type_name;
++      QualType QT = C.getCanonicalTagType(TD);
++      PrintingPolicy PP = C.getPrintingPolicy();
++      PP.FullyQualifiedName = true;
++      PP.SuppressUnwrittenScope = true;
++      QT.getAsStringInternal(type_name, PP);
++
++      return type_name;
++    }
++
++    return ND->getQualifiedNameAsString();
++  }
++
++  if (llvm::isa_and_nonnull<TranslationUnitDecl>(D)) {
++    return "";
++  }
++
++  return "<unnamed>";
 +}
 +
 +std::string GetQualifiedName(TCppType_t klass) {
@@ -4263,18 +4382,39 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +}
 +
 +TCppScope_t GetScopeFromCompleteName(const std::string& name) {
-+  return Cpp::GetScopeFromCompleteName(name) .data;
++  std::string delim = "::";
++  size_t start = 0;
++  size_t end = name.find(delim);
++  TCppScope_t curr_scope = 0;
++  while (end != std::string::npos) {
++    curr_scope = GetScope(name.substr(start, end - start), curr_scope);
++    start = end + delim.length();
++    end = name.find(delim, start);
++  }
++  return GetScope(name.substr(start, end), curr_scope);
 +}
 +
 +void GetStaticDatamembers(TCppScope_t scope,
 +                          std::vector<TCppScope_t>& datamembers) {
-+  std::vector<Cpp::DeclRef> datamembers_refs;
-+  Cpp::GetStaticDatamembers(Cpp::ConstDeclRef(scope), datamembers_refs);
-+  datamembers = unbox(datamembers_refs);
++  auto* record = llvm::dyn_cast_or_null<CXXRecordDecl>(static_cast<Decl*>(scope));
++  if(!record || !IsComplete(scope)) return;
++  record = record->getDefinition();
++  getSema().ForceDeclarationOfImplicitMembers(record);
++  for(auto* decl : record->decls()) {
++    if(llvm::isa<VarDecl>(decl)) datamembers.push_back(decl);
++    else if(auto* shadow = llvm::dyn_cast<UsingShadowDecl>(decl))
++      if(llvm::isa<VarDecl>(shadow->getTargetDecl())) datamembers.push_back(shadow);
++  }
 +}
 +
 +std::string GetTypeAsString(TCppType_t var) {
-+  return Cpp::GetTypeAsString(Cpp::ConstTypeRef(var));
++  QualType QT = QualType::getFromOpaquePtr(var);
++  // FIXME: Get the default printing policy from the ASTContext.
++  PrintingPolicy Policy((LangOptions()));
++  Policy.Bool = true;               // Print bool instead of _Bool.
++  Policy.SuppressTagKeyword = true; // Do not print `class std::string`.
++  Policy.FullyQualifiedName = true;
++  return QT.getAsString(Policy);
 +}
 +
 +TCppType_t GetTypeFromScope(TCppScope_t klass) {
@@ -4327,7 +4467,25 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +}
 +
 +bool IsComplete(TCppScope_t scope) {
-+  return Cpp::IsComplete(Cpp::ConstDeclRef(scope));
++  if (!scope)
++    return false;
++
++  Decl* D = static_cast<Decl*>(scope);
++
++  if (isa<ClassTemplateSpecializationDecl>(D)) {
++    QualType QT = QualType::getFromOpaquePtr(GetTypeFromScope(scope));
++    clang::Sema& S = getSema();
++    SourceLocation fakeLoc = GetValidSLoc(S);
++      return S.isCompleteType(fakeLoc, QT);
++  }
++
++  if (auto* CXXRD = dyn_cast<CXXRecordDecl>(D))
++    return CXXRD->hasDefinition();
++  else if (auto* TD = dyn_cast<TagDecl>(D))
++    return TD->getDefinition();
++
++  // Everything else is considered complete.
++  return true;
 +}
 +
 +bool IsConstMethod(TCppFunction_t method) {
@@ -4423,7 +4581,12 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +}
 +
 +bool IsTypeDerivedFrom(TCppType_t derived, TCppType_t base) {
-+  return Cpp::IsTypeDerivedFrom(Cpp::ConstTypeRef(derived), Cpp::ConstTypeRef(base));
++  auto& S = getSema();
++  auto fakeLoc = GetValidSLoc(S);
++  auto derivedType = clang::QualType::getFromOpaquePtr(derived);
++  auto baseType = clang::QualType::getFromOpaquePtr(base);
++
++  return S.IsDerivedFrom(fakeLoc, derivedType, baseType);
 +}
 +
 +bool IsTypedefed(TCppScope_t handle) {
@@ -4447,16 +4610,52 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +}
 +
 +TCppScope_t LookupDatamember(const std::string& name, TCppScope_t parent) {
-+  return Cpp::LookupDatamember(name, Cpp::ConstDeclRef(parent)) .data;
++  clang::DeclContext* Within = 0;
++  if (parent) {
++    auto* D = (clang::Decl*)parent;
++    Within = llvm::dyn_cast<clang::DeclContext>(D);
++  }
++
++  auto* ND = lookupNamed(name, Within);
++  if (ND && ND != (clang::NamedDecl*)-1) {
++    if (llvm::isa_and_nonnull<clang::FieldDecl>(ND)) {
++      return (TCppScope_t)ND;
++    }
++    // Members of anonymous structs/unions are found as indirect fields; the
++    // underlying field is what callers can query for type and access.
++    if (auto* IFD = llvm::dyn_cast<clang::IndirectFieldDecl>(ND))
++      return (TCppScope_t)IFD->getAnonField();
++  }
++
++  return 0;
 +}
++TCppScope_t GetScope(const std::string& name, TCppScope_t parent) {
++  // FIXME: GetScope should be replaced by a general purpose lookup
++  // and filter function. The function should be like GetNamed but
++  // also take in a filter parameter which determines which results
++  // to pass back
++  if (name == "")
++    return GetGlobalScope();
++
++  auto* ND = (NamedDecl*)GetNamed(name, parent);
++
++  if (!ND || ND == (NamedDecl*)-1)
++    return 0;
++
++  if (llvm::isa<NamespaceDecl>(ND) || llvm::isa<RecordDecl>(ND) ||
++      llvm::isa<ClassTemplateDecl>(ND) || llvm::isa<TypedefNameDecl>(ND) ||
++      llvm::isa<TypeAliasTemplateDecl>(ND) || llvm::isa<TypeAliasDecl>(ND))
++    return (TCppScope_t)(ND->getCanonicalDecl());
++
++  return 0;
++}
++
 +// Clang setup owned by jank: upstream's public constructor cannot supply an
 +// embedded PCH filesystem, a code model, or stale-PCH diagnostics.
 +namespace {
 +// Match CppInterOp 2.0.0's LLVM-23 lifetime policy: LLVM's late static
-+// destruction cannot safely tear down a JIT. Explicit deletion remains
-+// available for tests and hosts that shut down before their LLVM globals.
-+llvm::ManagedStatic<std::unique_ptr<compat::Interpreter>> owned_interpreter;
-+
++// destruction cannot safely tear down a JIT. The session intentionally
++// remains live for the lifetime of the process, including exit handlers.
 +class PCHStalenessDiagnosticConsumer final : public clang::DiagnosticConsumer {
 +  clang::DiagnosticConsumer &target;
 +  bool &out_of_date;
@@ -4478,7 +4677,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +};
 +}
 +
-+TInterp_t CreateInterpreter(std::vector<char const*> const &args,
++jank::jit::clang_interpreter* CreateInterpreter(std::vector<char const*> const &args,
 +                           std::vector<char const*> const &gpu_args,
 +                           std::map<char const*, std::string_view> const &vfs,
 +                           std::optional<int> const &cm, bool *pch_out_of_date) {
@@ -4487,8 +4686,10 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +    llvm::errs() << "jank's interpreter adapter does not support GPU arguments\n";
 +    return nullptr;
 +  }
-+  // Initialize CppInterOp's targets before constructing the Clang interpreter.
-+  if(Cpp::GetInterpreter()) {
++  llvm::InitializeNativeTarget();
++  llvm::InitializeNativeTargetAsmPrinter();
++  llvm::InitializeNativeTargetAsmParser();
++  if(*owned_interpreter) {
 +    llvm::errs() << "jank's interpreter is already initialized\n";
 +    return nullptr;
 +  }
@@ -4519,6 +4720,12 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +  diagnostics.setClient(&consumer, false);
 +  auto executor = std::make_unique<clang::IncrementalExecutorBuilder>();
 +  if(cm) executor->CM = static_cast<llvm::CodeModel::Model>(*cm);
++  auto state = std::make_shared<jank::jit::clang_interpreter::jit_state>();
++  executor->JITBuilder = std::make_unique<llvm::orc::LLJITBuilder>();
++  executor->JITBuilder->setNotifyCreatedCallback([state](llvm::orc::LLJIT& jit) {
++    state->engine = &jit;
++    return llvm::Error::success();
++  });
 +  auto inner = clang::Interpreter::create(std::move(*ci), std::move(executor));
 +  if(inner) {
 +    if(diagnostic_owner) diagnostics.setClient(diagnostic_owner.release(), true);
@@ -4533,11 +4740,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +    return nullptr;
 +  }
 +
-+#ifdef __GLIBC__
-+  CppInternal::installGlibcNonsharedSupport(*compat::getExecutionEngine(**inner), inner->get());
-+#endif
-+  *owned_interpreter = std::make_unique<compat::Interpreter>(std::move(*inner));
-+  Cpp::UseExternalInterpreter(Cpp::InterpRef(owned_interpreter->get()));
++  *owned_interpreter = std::make_unique<jank::jit::clang_interpreter>(std::move(*inner), std::move(state));
 +  auto *engine = (*owned_interpreter)->getExecutionEngine();
 +  // These helpers are exported by the packaged library and are required by
 +  // clang::Interpreter's expression-value lowering.
@@ -4557,26 +4760,10 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +  return owned_interpreter->get();
 +}
 +
-+bool DeleteInterpreter(TInterp_t interpreter) {
-+  if(interpreter && interpreter != owned_interpreter->get()) return false;
-+  if(!*owned_interpreter) return false;
-+  Cpp::DeleteInterpreter(Cpp::InterpRef(owned_interpreter->get()));
-+  owned_interpreter->reset();
-+  return true;
-+}
 +
 +} // namespace jank_cpp
 --- a/compiler+runtime/src/cpp/jank/analyze/processor.cpp
 +++ b/compiler+runtime/src/cpp/jank/analyze/processor.cpp
-@@ -195,7 +195,7 @@
- 
-   static processor::expression_result
-   build_builtin_operator_call(expr::cpp_value_ref const val,
--                              Cpp::Operator const op,
-+                              jank_cpp::Operator const op,
-                               native_vector<expression_ref> &&arg_exprs,
-                               std::vector<cppinterop::clang_type> const &arg_types,
-                               local_frame_ptr const current_frame,
 @@ -388,7 +388,7 @@
        auto const obj_type{ cppinterop::get_non_reference_type(arg_types[0]) };
        auto const op_name{ try_object<obj::symbol>(val->form)->name };
@@ -4595,68 +4782,240 @@ and matching LLVM headers. No forked CppInterOp library is built.
        cppinterop::get_operator(op, arg_types, fns, arity);
  
        if(fns.empty())
-@@ -5539,7 +5539,7 @@
-             ->add_usage(object_source(o));
-         }
+--- a/compiler+runtime/src/cpp/jank/environment/check_health.cpp
++++ b/compiler+runtime/src/cpp/jank/environment/check_health.cpp
+@@ -6,7 +6,7 @@
+ #include <llvm/TargetParser/Host.h>
+ #include <llvm/Support/Program.h>
  
--        native_vector<Cpp::TemplateArgInfo> args;
-+        native_vector<jank_cpp::TemplateArgInfo> args;
-         for(auto const arg : make_sequence_range(rest(o)))
-         {
-           if(runtime::is_integral(arg))
---- a/compiler+runtime/src/cpp/jank/codegen/cpp_processor.cpp
-+++ b/compiler+runtime/src/cpp/jank/codegen/cpp_processor.cpp
-@@ -1794,7 +1794,7 @@
-   jtl::option<identifier> gen(ir::inst::cpp_builtin_operator_call_ref const inst, builder &b)
-   {
-     b.next_instruction();
--    auto const op_name{ operator_name(static_cast<Cpp::Operator>(inst->expr->op)).unwrap() };
-+    auto const op_name{ operator_name(static_cast<jank_cpp::Operator>(inst->expr->op)).unwrap() };
+-#include <CppInterOp/Compatibility.h>
++#include <jank/jit/clang_interpreter.hpp>
  
-     if(inst->args.size() == 1)
-     {
---- a/compiler+runtime/src/cpp/jank/ir/print.cpp
-+++ b/compiler+runtime/src/cpp/jank/ir/print.cpp
-@@ -644,7 +644,7 @@
-     util::format_to(sb,
-                     "{:name {} :op :cpp/builtin-operator-call :op \"{}\" :args [",
-                     name,
--                    operator_name(static_cast<Cpp::Operator>(expr->op)).unwrap());
-+                    operator_name(static_cast<jank_cpp::Operator>(expr->op)).unwrap());
-     bool needs_space{};
-     for(auto const &arg : args)
-     {
+ #include <jtl/terminal.hpp>
+ 
+--- /dev/null
++++ b/compiler+runtime/src/cpp/jank/jit/clang_interpreter.cpp
+@@ -0,0 +1,152 @@
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// LLVM 23 workarounds adapted from CppInterOp 2.0.0.
++#include <jank/jit/clang_interpreter.hpp>
++#include <llvm/IR/Constants.h>
++#include <llvm/TargetParser/Triple.h>
++#include <dlfcn.h>
++#include <pthread.h>
++#include <cstdlib>
++#include <llvm/ExecutionEngine/Orc/AbsoluteSymbols.h>
++
++#ifdef __GLIBC__
++extern "C" void __stack_chk_fail_local();
++#endif
++namespace jank::jit {
++namespace {
++static bool bindProcessWeakGlobals(llvm::Module& M) {
++  if (!llvm::Triple(M.getTargetTriple()).isOSBinFormatELF())
++    return false;
++
++  auto ProcessHas = [](llvm::StringRef Name) {
++    return ::dlsym(RTLD_DEFAULT, Name.str().c_str()) != nullptr;
++  };
++
++  llvm::SmallVector<llvm::GlobalVariable*, 8> Demoted;
++  for (llvm::GlobalVariable& GV : M.globals()) {
++    if (GV.isDeclaration() || !GV.isWeakForLinker() || GV.isThreadLocal() ||
++        GV.isConstant())
++      continue;
++
++    llvm::StringRef Name = GV.getName();
++    // Guards are only ever demoted together with their variable, below.
++    if (Name.starts_with("_ZGV"))
++      continue;
++    if (!ProcessHas(Name))
++      continue;
++
++    llvm::GlobalVariable* Guard = nullptr;
++    if (Name.starts_with("_Z")) {
++      llvm::GlobalVariable* G =
++          M.getNamedGlobal(("_ZGV" + Name.drop_front(2)).str());
++      if (G && !G->isDeclaration()) {
++        if (!ProcessHas(G->getName()))
++          continue;
++        Guard = G;
++      }
++    }
++
++    Demoted.push_back(&GV);
++    if (Guard)
++      Demoted.push_back(Guard);
++  }
++  if (Demoted.empty())
++    return false;
++
++  for (llvm::GlobalVariable* GV : Demoted) {
++    GV->setInitializer(nullptr);
++    GV->setLinkage(llvm::GlobalValue::ExternalLinkage);
++    GV->setComdat(nullptr);
++    GV->setVisibility(llvm::GlobalValue::DefaultVisibility);
++    GV->setDSOLocal(false);
++  }
++
++  // Declarations may not appear in the used lists; drop demoted entries.
++  for (const char* ListName : {"llvm.used", "llvm.compiler.used"}) {
++    llvm::GlobalVariable* Used = M.getNamedGlobal(ListName);
++    if (!Used || !Used->hasInitializer())
++      continue;
++    auto* Init = llvm::cast<llvm::ConstantArray>(Used->getInitializer());
++    llvm::SmallVector<llvm::Constant*, 8> Kept;
++    for (llvm::Value* Op : Init->operand_values()) {
++      auto* C = llvm::cast<llvm::Constant>(Op);
++      if (!llvm::is_contained(Demoted, C->stripPointerCasts()))
++        Kept.push_back(C);
++    }
++    if (Kept.size() == Init->getNumOperands())
++      continue;
++    Used->eraseFromParent();
++    if (!Kept.empty()) {
++      auto* ATy = llvm::ArrayType::get(Kept.front()->getType(), Kept.size());
++      auto* NewUsed = new llvm::GlobalVariable(
++          M, ATy, /*isConstant=*/false, llvm::GlobalValue::AppendingLinkage,
++          llvm::ConstantArray::get(ATy, Kept), ListName);
++      NewUsed->setSection("llvm.metadata");
++    }
++  }
++  return true;
++}
++static void dedupeWeakEmulatedTLS(llvm::Module& M, llvm::StringSet<>& Defined) {
++  if (!llvm::Triple(M.getTargetTriple()).isOSBinFormatELF())
++    return;
++
++  for (llvm::GlobalVariable& GV : M.globals()) {
++    if (!GV.isThreadLocal() || GV.isDeclaration() || !GV.isWeakForLinker())
++      continue;
++
++    // First definer wins; later duplicates become references, mirroring what
++    // discard() would have done (available_externally + no comdat) but without
++    // hitting the crashing code path.
++    if (!Defined.insert(GV.getName()).second) {
++      GV.setLinkage(llvm::GlobalValue::AvailableExternallyLinkage);
++      GV.setComdat(nullptr);
++    }
++  }
++}
++}
++clang_interpreter::clang_interpreter(std::unique_ptr<clang::Interpreter> native,
++                                    std::shared_ptr<jit_state> state)
++  : native(std::move(native)), state(std::move(state)) {
++#ifdef __GLIBC__
++  auto* engine = getExecutionEngine();
++  // These glibc functions come from libc_nonshared.a and cannot be found by
++  // dlsym. The jank session lives until process exit, so registered JIT handlers
++  // remain callable for quick_exit and fork. LLJIT handles atexit itself.
++  llvm::orc::SymbolMap symbols;
++  for(auto [name, address] : {
++      std::pair{"at_quick_exit", reinterpret_cast<void*>(&::at_quick_exit)},
++      std::pair{"pthread_atfork", reinterpret_cast<void*>(&::pthread_atfork)},
++      std::pair{"__stack_chk_fail_local", reinterpret_cast<void*>(&::__stack_chk_fail_local)}}) {
++    symbols[engine->mangleAndIntern(name)] = {
++      llvm::orc::ExecutorAddr::fromPtr(address),
++      llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable};
++  }
++  llvm::cantFail(engine->getProcessSymbolsJITDylib()->define(
++    llvm::orc::absoluteSymbols(std::move(symbols))));
++#endif
++}
++clang_interpreter::~clang_interpreter() = default;
++llvm::orc::LLJIT* clang_interpreter::getExecutionEngine() {
++  llvm::cantFail(native->getExecutionEngine());
++  assert(state->engine && "Clang must construct the supplied JIT builder");
++  return state->engine;
++}
++llvm::Error clang_interpreter::Execute(clang::PartialTranslationUnit& unit) {
++  if(unit.TheModule) {
++    bindProcessWeakGlobals(*unit.TheModule);
++    dedupeWeakEmulatedTLS(*unit.TheModule, defined_tls);
++  }
++  return native->Execute(unit);
++}
++llvm::Error clang_interpreter::ParseAndExecute(llvm::StringRef code, clang::Value* value) {
++  if(value) return native->ParseAndExecute(code, value);
++  auto unit = Parse(code);
++  if(!unit) return unit.takeError();
++  if(unit->TheModule) return Execute(*unit);
++  return llvm::Error::success();
++}
++void* clang_interpreter::getAddressOfGlobal(clang::GlobalDecl decl) {
++  auto address = native->getSymbolAddress(decl);
++  if(!address) { llvm::consumeError(address.takeError()); return nullptr; }
++  return address->toPtr<void*>();
++}
++}
+--- a/compiler+runtime/src/cpp/jank/jit/object_dynamic.cpp
++++ b/compiler+runtime/src/cpp/jank/jit/object_dynamic.cpp
+@@ -7,7 +7,7 @@
+ 
+ #include <llvm/ExecutionEngine/JITLink/JITLink.h>
+ 
+-#include <CppInterOp/Compatibility.h>
++#include <jank/jit/clang_interpreter.hpp>
+ 
+ #include <cpptrace/gdb_jit.hpp>
+ 
 --- a/compiler+runtime/src/cpp/jank/jit/processor_dynamic.cpp
 +++ b/compiler+runtime/src/cpp/jank/jit/processor_dynamic.cpp
-@@ -20,7 +20,7 @@
+@@ -19,8 +19,8 @@
+ #include <llvm/IRReader/IRReader.h>
  #include <llvm/Support/Signals.h>
  
- #include <CppInterOp/Compatibility.h>
+-#include <CppInterOp/Compatibility.h>
 -#include <CppInterOp/CppInterOp.h>
++#include <jank/jit/clang_interpreter.hpp>
 +#include <jank/analyze/cppinterop_extensions.hpp>
  
  #include <jank/jit/object.hpp>
  #include <jank/jit/parse_ld_script.hpp>
+@@ -317,7 +317,7 @@
+         vfs,
+         static_cast<int>(llvm::CodeModel::Large),
+         &pch_out_of_date) };
+-      return static_cast<CppInternal::Interpreter *>(created.data);
++      return created;
+     } };
+ 
+     auto *created_interpreter{ create_interpreter() };
+--- a/compiler+runtime/src/cpp/jank/runtime/context_dynamic.cpp
++++ b/compiler+runtime/src/cpp/jank/runtime/context_dynamic.cpp
+@@ -2,7 +2,7 @@
+ 
+ #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+ 
+-#include <CppInterOp/Compatibility.h>
++#include <jank/jit/clang_interpreter.hpp>
+ 
+ #include <jank/read/lex.hpp>
+ #include <jank/read/parse.hpp>
+--- a/compiler+runtime/src/cpp/jank/util/clang.cpp
++++ b/compiler+runtime/src/cpp/jank/util/clang.cpp
+@@ -11,7 +11,7 @@
+ #include <clang/Driver/ToolChain.h>
+ #include <clang/Frontend/TextDiagnosticPrinter.h>
+ 
+-#include <CppInterOp/Compatibility.h>
++#include <jank/jit/clang_interpreter.hpp>
+ 
+ #include <llvm/TargetParser/Host.h>
+ #include <llvm/Support/Program.h>
 --- a/compiler+runtime/src/cpp/main.cpp
 +++ b/compiler+runtime/src/cpp/main.cpp
-@@ -8,7 +8,7 @@
+@@ -7,8 +7,8 @@
+ 
  #include <isocline.h>
  
- #include <CppInterOp/Compatibility.h>
+-#include <CppInterOp/Compatibility.h>
 -#include <CppInterOp/CppInterOp.h>
++#include <jank/jit/clang_interpreter.hpp>
 +#include <jank/analyze/cppinterop_extensions.hpp>
  
  #include <jank/read/lex.hpp>
  #include <jank/read/parse.hpp>
-@@ -262,7 +262,7 @@
-       jank_init_core_libs();
- #endif
- 
--      Cpp::EnableDebugOutput(false);
-+      jank_cpp::EnableDebugOutput(false);
- 
-       {
-         runtime::detail::native_transient_vector extra_args;
 --- a/compiler+runtime/test/cpp/jank/analyze/cpp_util.cpp
 +++ b/compiler+runtime/test/cpp/jank/analyze/cpp_util.cpp
 @@ -56,14 +56,14 @@
@@ -4682,7 +5041,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
    }
  
    TEST_CASE("resolve_candidates ranks access/const violations above conversion failures")
-@@ -119,9 +119,61 @@
+@@ -119,9 +119,97 @@
          public_index = i;
        }
      }
@@ -4728,7 +5087,7 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +    REQUIRE(templates.size() == 1);
 +    DOCTEST_CHECK(cppinterop::is_templated_function(templates.front()));
 +    auto const integer{ cpp_util::int_type() };
-+    jank_cpp::TemplateArgInfo const argument{ integer };
++    Cpp::TemplateArgInfo const argument{ integer };
 +    auto const instance{ cppinterop::instantiate_template(templates.front(), &argument, 1, true) };
 +    REQUIRE(instance);
 +    DOCTEST_CHECK(cppinterop::get_canonical_type(cppinterop::get_function_return_type(instance))
@@ -4747,4 +5106,62 @@ and matching LLVM headers. No forked CppInterOp library is built.
 +    REQUIRE(info.m_Arguments.size() == 1);
 +    DOCTEST_CHECK(info.m_Arguments.front().m_Conversion == jank_cpp::OverloadCandidateConversion::None);
 +  }
++
++  TEST_CASE("reflection uses the native session for members and template bases")
++  {
++    jank::runtime::__rt_ctx->eval_cpp_string(R"cpp(
++      namespace jank::test::native_session {
++        struct base { int value; inline static int count = 7; };
++        template<class T> struct derived : base { T payload; };
++      }
++    )cpp").expect_ok();
++    auto const scope{ cppinterop::get_scope_from_complete_name("jank::test::native_session") };
++    REQUIRE(scope);
++    auto const base{ cppinterop::get_named("base", scope) };
++    REQUIRE(base);
++    std::vector<cppinterop::clang_decl> members;
++    cppinterop::get_datamembers(base, members);
++    REQUIRE(members.size() == 1);
++    DOCTEST_CHECK(cppinterop::get_name(members.front()) == "value");
++    members.clear();
++    cppinterop::get_static_datamembers(base, members);
++    REQUIRE(members.size() == 1);
++    DOCTEST_CHECK(cppinterop::get_name(members.front()) == "count");
++    auto const address{ cppinterop::get_variable_offset(members.front(), base) };
++    REQUIRE(address != 0);
++    DOCTEST_CHECK(*reinterpret_cast<int const*>(address) == 7);
++    auto const derived{ cppinterop::get_named("derived", scope) };
++    REQUIRE(derived);
++    Cpp::TemplateArgInfo const argument{ cpp_util::int_type() };
++    auto const instance{ cppinterop::instantiate_template(derived, &argument, 1, false) };
++    REQUIRE(instance);
++    DOCTEST_CHECK(cppinterop::is_complete(instance));
++    REQUIRE(cppinterop::get_num_bases(instance) == 1);
++    DOCTEST_CHECK(cppinterop::get_base_class(instance, 0) == base);
++    DOCTEST_CHECK(cppinterop::is_type_derived_from(cppinterop::get_type_from_scope(instance),
++                                                 cppinterop::get_type_from_scope(base)));
++  }
++
 +}
+--- a/compiler+runtime/test/cpp/jank/jit/processor.cpp
++++ b/compiler+runtime/test/cpp/jank/jit/processor.cpp
+@@ -7,7 +7,7 @@
+ #include <clang/Frontend/CompilerInstance.h>
+ #include <clang/Frontend/TextDiagnosticPrinter.h>
+ 
+-#include <CppInterOp/Compatibility.h>
++#include <jank/jit/clang_interpreter.hpp>
+ 
+ #include <jtl/terminal.hpp>
+ 
+--- a/compiler+runtime/test/cpp/main.cpp
++++ b/compiler+runtime/test/cpp/main.cpp
+@@ -6,7 +6,7 @@
+ #include <llvm/Support/ManagedStatic.h>
+ #include <llvm/Support/TargetSelect.h>
+ 
+-#include <CppInterOp/Compatibility.h>
++#include <jank/jit/clang_interpreter.hpp>
+ #include <CppInterOp/CppInterOp.h>
+ 
+ #include <jank/c_api.h>
