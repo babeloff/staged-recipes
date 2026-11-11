@@ -1,0 +1,96 @@
+From: conda-forge maintainers
+Subject: [PATCH] Link the packaged CppInterOp and its embedded LLVM
+
+Use upstream 2.0.0 private headers only for the interpreter bridge; public
+headers belong to the package. Check its LLVM version against the headers.
+CppInterOp embeds LLVM/Clang, so use raw auxiliary archives to supply only
+missing format/debug/object helpers, without imported-target dependencies
+loading a second LLVM shared library.
+
+--- a/compiler+runtime/CMakeLists.txt
++++ b/compiler+runtime/CMakeLists.txt
+@@ -493,7 +493,12 @@
+ include(FetchContent)
+ include(cmake/dependency/bdwgc.cmake)
+ find_package(cpptrace 1.0.4 CONFIG REQUIRED)
+-include(cmake/dependency/cppinterop.cmake)
++# CppInterOp 2.0.0's private interpreter headers are needed by jank's
++# Clang extension adapter. They must match the packaged library exactly.
++find_package(CppInterOp 2.0.0 EXACT CONFIG REQUIRED)
++if(NOT CPPINTEROP_LLVM_VERSION VERSION_EQUAL LLVM_PACKAGE_VERSION)
++  message(FATAL_ERROR "CppInterOp's LLVM ${CPPINTEROP_LLVM_VERSION} does not match ${LLVM_PACKAGE_VERSION}")
++endif()
+ 
+ # Folly exports the unnamespaced gflags_shared target without finding gflags.
+ # Load it before Folly so CMake resolves the target to libgflags.
+@@ -501,6 +506,13 @@
+ find_package(gflags CONFIG REQUIRED)
+ find_package(folly CONFIG REQUIRED)
+ find_package(nlohmann_json 3.12 CONFIG REQUIRED)
++
++# The conda-forge library embeds LLVM/Clang. Link only the extra archive
++# members jank needs; imported Clang targets would also link libLLVM.so.
++set(jank_cppinterop_aux_libraries)
++foreach(component IN ITEMS clangFormat clangToolingInclusions clangToolingCore clangRewrite LLVMOrcDebugging LLVMObject LLVMOrcTargetProcess LLVMSupport)
++  list(APPEND jank_cppinterop_aux_libraries "$<TARGET_FILE:${component}>")
++endforeach()
+ include(cmake/dependency/isocline.cmake)
+ 
+ if(jank_test)
+@@ -661,7 +673,7 @@
+   "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third-party/bdwgc/include>"
+   "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third-party/immer>"
+   "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third-party/zip/src>"
+-  "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third-party/cppinterop/include>"
++  ${CPPINTEROP_INCLUDE_DIRS}
+   "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third-party/cppinterop/lib>"
+   "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third-party/stduuid/include/>"
+   "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third-party/isocline/include>"
+@@ -704,7 +716,7 @@
+   endif()
+ endforeach()
+ 
+-list(APPEND jank_linker_flags -lfolly -lcpptrace)
++list(APPEND jank_linker_flags -lfolly -lcpptrace -lclangCppInterOp -lclangFormat -lclangToolingInclusions -lclangToolingCore -lclangRewrite -lLLVMOrcDebugging -lLLVMObject -lLLVMOrcTargetProcess -lLLVMSupport -pthread)
+ set(jank_lib_linker_flags_list "")
+ 
+ get_target_property(jank_lib_link_dirs_prop jank_common_lib LINK_DIRECTORIES)
+@@ -849,6 +861,7 @@
+   src/cpp/jank/analyze/step/force_boxed.cpp
+   src/cpp/jank/analyze/cpp_util.cpp
+   src/cpp/jank/analyze/cppinterop.cpp
++  src/cpp/jank/analyze/cppinterop_extensions.cpp
+   src/cpp/jank/analyze/pass/walk.cpp
+   src/cpp/jank/analyze/pass/optimize.cpp
+   src/cpp/jank/analyze/pass/strip_source_meta.cpp
+@@ -912,7 +925,7 @@
+   jank_exe_phase_1 PUBLIC
+   # Keep force-load and its archive together when Phase 2 inherits this link list.
+   "$<LINK_LIBRARY:WHOLE_ARCHIVE,${CMAKE_BINARY_DIR}/libjank-dynamic-runtime-phase-1.a>"
+-  LLVM clang-cpp
++  clangCppInterOp ${jank_cppinterop_aux_libraries}
+   Folly::folly cpptrace::cpptrace
+   isocline
+   ZLIB::ZLIB
+@@ -1035,7 +1048,7 @@
+     jank_test_exe PUBLIC
+     ${jank_link_whole_start} ${CMAKE_BINARY_DIR}/libjank-dynamic-runtime-phase-1.a ${jank_link_whole_end}
+     ZLIB::ZLIB
+-    LLVM clang-cpp
++    clangCppInterOp ${jank_cppinterop_aux_libraries}
+     doctest::doctest
+   )
+ 
+--- a/compiler+runtime/cmake/install.cmake
++++ b/compiler+runtime/cmake/install.cmake
+@@ -66,10 +66,6 @@
+   PATTERN "${CMAKE_SOURCE_DIR}/third-party/immer/immer/*"
+ )
+ 
+-jank_glob_install_without_prefix(
+-  INPUT_PREFIX "${CMAKE_SOURCE_DIR}/third-party/cppinterop/"
+-  PATTERN "${CMAKE_SOURCE_DIR}/third-party/cppinterop/include/*"
+-)
+ jank_glob_install_without_prefix(
+   INPUT_PREFIX "${CMAKE_SOURCE_DIR}/third-party/cppinterop/lib/"
+   OUTPUT_PREFIX "include/"

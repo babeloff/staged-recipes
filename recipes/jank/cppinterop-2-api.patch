@@ -1,0 +1,4750 @@
+From: conda-forge maintainers
+Subject: [PATCH] Adapt jank's Clang facade to upstream CppInterOp 2.0.0
+
+Keep fork-only reflection, overload diagnostics and interpreter setup in a
+jank-owned facade. Delegate equivalent operations to the packaged library,
+converting typed handles explicitly. Preserve array and reference semantics,
+function-template lookup, qualified constructor lookup, embedded PCH files,
+stale-PCH recovery and the large JIT code model.
+
+The private interpreter bridge requires the exact upstream 2.0.0 headers
+and matching LLVM headers. No forked CppInterOp library is built.
+
+--- a/compiler+runtime/include/cpp/jank/analyze/cpp_util.hpp
++++ b/compiler+runtime/include/cpp/jank/analyze/cpp_util.hpp
+@@ -1,6 +1,6 @@
+ #pragma once
+ 
+-#include <CppInterOp/CppInterOp.h>
++#include <jank/analyze/cppinterop_extensions.hpp>
+ 
+ #include <jtl/ptr.hpp>
+ #include <jtl/result.hpp>
+@@ -20,7 +20,7 @@
+ 
+   jtl::string_result<void> instantiate_if_needed(jtl::ptr<void> const scope);
+   jtl::string_result<jtl::ptr<void>>
+-  instantiate(jtl::ptr<void> const scope, native_vector<Cpp::TemplateArgInfo> const &args);
++  instantiate(jtl::ptr<void> const scope, native_vector<jank_cpp::TemplateArgInfo> const &args);
+ 
+   jtl::ptr<void> resolve_type(jtl::immutable_string const &sym);
+   jtl::string_result<jtl::ptr<void>> resolve_scope(jtl::immutable_string const &sym);
+@@ -103,8 +103,8 @@
+ 
+   usize offset_to_typed_object_base(jtl::ptr<void> type);
+ 
+-  jtl::option<Cpp::Operator> match_operator(jtl::immutable_string const &name);
+-  jtl::option<jtl::immutable_string> operator_name(Cpp::Operator const op);
++  jtl::option<jank_cpp::Operator> match_operator(jtl::immutable_string const &name);
++  jtl::option<jtl::immutable_string> operator_name(jank_cpp::Operator const op);
+ 
+   jtl::result<void, error_ref> ensure_convertible(expression_ref const expr);
+ 
+--- a/compiler+runtime/include/cpp/jank/analyze/cppinterop.hpp
++++ b/compiler+runtime/include/cpp/jank/analyze/cppinterop.hpp
+@@ -10,7 +10,7 @@
+ 
+ #include <jtl/ptr.hpp>
+ 
+-namespace CppImpl
++namespace jank_cpp
+ {
+   struct TemplateArgInfo;
+   enum Operator : unsigned char;
+@@ -155,12 +155,12 @@
+   bool is_type_derived_from(clang_type derived, clang_type base);
+   bool is_const_method(clang_decl method);
+   std::string get_function_arg_name(clang_decl func, size_t param_index);
+-  void get_operator(CppImpl::Operator op,
++  void get_operator(jank_cpp::Operator op,
+                     std::vector<clang_type> const &arg_types,
+                     std::vector<clang_decl> &operators,
+-                    CppImpl::OperatorArity kind);
++                    jank_cpp::OperatorArity kind);
+   clang_type
+-  get_builtin_operator_type(CppImpl::Operator op, std::vector<clang_type> const &arg_types);
++  get_builtin_operator_type(jank_cpp::Operator op, std::vector<clang_type> const &arg_types);
+   clang_decl create_interpreter(std::vector<char const *> const &args = {},
+                                 std::vector<char const *> const &gpu_args = {},
+                                 std::map<char const *, std::string_view> const &vfs = {},
+@@ -168,14 +168,14 @@
+                                 bool *pch_out_of_date = nullptr);
+   std::string detect_resource_dir(char const *clang_binary_name = "clang");
+   clang_decl instantiate_template(clang_decl tmpl,
+-                                  CppImpl::TemplateArgInfo const *template_args,
++                                  jank_cpp::TemplateArgInfo const *template_args,
+                                   size_t template_args_size,
+                                   bool instantiate_body = false);
+   bool instantiate_template(clang_decl spec);
+   std::vector<clang_decl> best_overload_match(std::vector<clang_decl> const &candidates,
+                                               std::vector<clang_type> const &arg_types,
+                                               std::vector<clang_decl> const &arg_scopes);
+-  CppImpl::OverloadCandidateInfo
++  jank_cpp::OverloadCandidateInfo
+   get_overload_candidate_info(clang_decl candidate,
+                               std::vector<clang_type> const &arg_types,
+                               std::vector<clang_decl> const &arg_scopes);
+--- /dev/null
++++ b/compiler+runtime/include/cpp/jank/analyze/cppinterop_extensions.hpp
+@@ -0,0 +1,429 @@
++//===--- CppInterOp.h - A layer for language interoperability ---*- C++ -*-===//
++//
++// Part of the compiler-research project, under the Apache License v2.0 with
++// LLVM Exceptions.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file defines API for introspection which enables language
++// interoperability.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef JANK_CPPINTEROP_EXTENSIONS_HPP
++#define JANK_CPPINTEROP_EXTENSIONS_HPP
++
++#include <cassert>
++#include <cstddef>
++#include <cstdint>
++#include <map>
++#include <optional>
++#include <set>
++#include <string>
++#include <sys/types.h>
++#include <vector>
++
++#include <CppInterOp/CppInterOp.h>
++
++namespace jank_cpp {
++using TCppIndex_t = size_t;
++using TCppScope_t = void*;
++using TCppConstScope_t = const void*;
++using TCppType_t = void*;
++using TCppFunction_t = void*;
++using TCppConstFunction_t = const void*;
++using TCppFuncAddr_t = void*;
++using TInterp_t = void*;
++using TCppObject_t = void*;
++using TModule_t = void*;
++
++enum Operator : unsigned char {
++  OP_None,
++  OP_New,
++  OP_Delete,
++  OP_Array_New,
++  OP_Array_Delete,
++  OP_Plus,
++  OP_Minus,
++  OP_Star,
++  OP_Slash,
++  OP_Percent,
++  OP_Caret,
++  OP_Amp,
++  OP_Pipe,
++  OP_Tilde,
++  OP_Exclaim,
++  OP_Equal,
++  OP_Less,
++  OP_Greater,
++  OP_PlusEqual,
++  OP_MinusEqual,
++  OP_StarEqual,
++  OP_SlashEqual,
++  OP_PercentEqual,
++  OP_CaretEqual,
++  OP_AmpEqual,
++  OP_PipeEqual,
++  OP_LessLess,
++  OP_GreaterGreater,
++  OP_LessLessEqual,
++  OP_GreaterGreaterEqual,
++  OP_EqualEqual,
++  OP_ExclaimEqual,
++  OP_LessEqual,
++  OP_GreaterEqual,
++  OP_Spaceship,
++  OP_AmpAmp,
++  OP_PipePipe,
++  OP_PlusPlus,
++  OP_MinusMinus,
++  OP_Comma,
++  OP_ArrowStar,
++  OP_Arrow,
++  OP_Call,
++  OP_Subscript,
++  OP_Conditional,
++  OP_Coawait,
++};
++
++enum OperatorArity : unsigned char { kUnary = 1, kBinary, kBoth };
++
++/// Enum modelling CVR qualifiers.
++enum QualKind : unsigned char {
++  Const = 1 << 0,
++  Volatile = 1 << 1,
++  Restrict = 1 << 2
++};
++
++inline QualKind operator|(QualKind a, QualKind b) {
++  return static_cast<QualKind>(static_cast<unsigned char>(a) |
++                               static_cast<unsigned char>(b));
++}
++
++enum class ValueKind : std::uint8_t {
++  None,
++  LValue,
++  RValue,
++};
++
++struct TemplateArgInfo {
++  TCppType_t m_Type;
++  const char* m_IntegralValue;
++  TemplateArgInfo(TCppScope_t type, const char* integral_value = nullptr)
++      : m_Type(type), m_IntegralValue(integral_value) {}
++};
++
++enum class OverloadCandidateConversion : unsigned char {
++  Invalid,
++  None,
++  Implicit,
++  UserDefined,
++};
++
++struct OverloadCandidateArgument {
++  TCppType_t m_ParamType = nullptr;
++  OverloadCandidateConversion m_Conversion =
++      OverloadCandidateConversion::Invalid;
++};
++
++struct OverloadCandidateInfo {
++  bool m_Viable = false;
++  bool m_IsTemplateInstantiationFailure = false;
++  std::string m_Reason;
++  std::vector<OverloadCandidateArgument> m_Arguments;
++};
++
++// The facade preserves jank's raw Clang handles and fork-specific semantics.
++// Definitions delegate to upstream CppInterOp where its API is equivalent;
++// the remaining operations are implemented with Clang's AST/Sema APIs.
++std::string MangleRTTI(TCppType_t type);
++
++void EnableDebugOutput(bool value = true);
++
++bool IsNamespace(TCppScope_t scope);
++
++bool IsClass(TCppScope_t scope);
++
++bool IsClassTemplate(TCppScope_t scope);
++
++bool IsFunction(TCppScope_t scope);
++
++bool IsFunctionPointerType(TCppType_t type);
++
++bool IsInlineFriendFunction(TCppScope_t scope);
++
++bool IsComplete(TCppScope_t scope);
++
++bool IsBuiltin(TCppType_t type);
++
++bool IsIntegral(TCppType_t type);
++
++bool IsVoid(TCppType_t type);
++
++TCppType_t GetVoidType();
++
++bool IsTemplate(TCppScope_t handle);
++
++bool IsTemplateSpecialization(TCppScope_t handle);
++
++bool IsTemplateSpecializationOf(TCppScope_t spec,
++                                               TCppScope_t templ);
++
++bool IsTypedefed(TCppScope_t handle);
++
++TCppType_t GetCommonType(TCppType_t lhs, TCppType_t rhs);
++
++bool IsImplicitlyConvertible(TCppType_t from_type,
++                                            TCppType_t to_type);
++
++bool IsCStyleConvertible(TCppType_t from_type,
++                                        TCppType_t to_type);
++
++bool IsConstructible(TCppType_t to_type, TCppType_t from_type);
++
++bool IsTriviallyDestructible(TCppType_t type);
++
++bool IsEnumScope(TCppScope_t handle);
++
++bool IsEnumConstant(TCppScope_t handle);
++
++bool IsEnumType(TCppType_t type);
++
++bool HasTypeQualifier(TCppType_t type, QualKind qual);
++
++bool IsVariable(TCppScope_t scope);
++
++std::string GetName(TCppScope_t klass);
++
++std::string GetQualifiedName(TCppScope_t klass);
++
++std::string GetQualifiedCompleteName(TCppScope_t klass);
++
++std::string GetTruncatedName(TCppScope_t klass);
++
++std::string GetQualifiedCompleteNameWithTemplateArgs(TCppScope_t klass);
++
++TCppScope_t GetGlobalScope();
++
++TCppScope_t GetUnderlyingScope(TCppScope_t scope);
++
++TCppScope_t GetScopeFromCompleteName(const std::string& name);
++
++TCppScope_t GetNamed(const std::string& name,
++                                    TCppScope_t parent = nullptr);
++
++TCppScope_t GetParentScope(TCppScope_t scope);
++
++TCppScope_t GetScopeFromType(TCppType_t type);
++
++TCppIndex_t GetNumBases(TCppScope_t klass);
++
++TCppScope_t GetBaseClass(TCppScope_t klass, TCppIndex_t ibase);
++
++bool HasUsableCopyConstructor(TCppScope_t scope);
++
++bool HasUsableMoveConstructor(TCppScope_t scope);
++
++bool HasDeletedMoveConstructor(TCppScope_t scope);
++
++std::vector<TCppFunction_t>
++GetFunctionsUsingName(TCppScope_t scope, const std::string& name);
++
++TCppType_t GetFunctionReturnType(TCppFunction_t func);
++
++TCppIndex_t GetFunctionNumArgs(TCppFunction_t func);
++
++TCppIndex_t GetFunctionRequiredArgs(TCppConstFunction_t func);
++
++TCppType_t GetFunctionArgType(TCppFunction_t func,
++                                             TCppIndex_t iarg);
++
++std::string GetFunctionSignature(TCppType_t func);
++
++std::string GetFunctionSourceInfo(TCppFunction_t func);
++
++TCppType_t GetFunctionReturnTypeFromType(TCppType_t func);
++
++TCppIndex_t GetFunctionNumArgsFromType(TCppType_t func);
++
++TCppType_t GetFunctionArgTypeFromType(TCppType_t func,
++                                                     TCppIndex_t iarg);
++
++bool IsFunctionVariadic(TCppFunction_t function);
++
++bool IsFunctionVariadicTemplate(TCppFunction_t fn);
++
++bool IsFunctionDeleted(TCppConstFunction_t function);
++
++bool IsFunctionTypeConst(TCppType_t function_type);
++
++bool IsTemplatedFunction(TCppFunction_t func);
++
++bool IsBodylessFunctionTemplateSpecialization(TCppFunction_t func);
++
++void LookupConstructors(const std::string& name,
++                                       TCppScope_t parent,
++                                       std::vector<TCppFunction_t>& funcs);
++
++bool IsMethod(TCppConstFunction_t method);
++
++bool IsProtectedMethod(TCppFunction_t method);
++
++bool IsPrivateMethod(TCppFunction_t method);
++
++bool IsConstructor(TCppConstFunction_t method);
++
++bool IsDestructor(TCppConstFunction_t method);
++
++bool IsStaticMethod(TCppConstFunction_t method);
++
++void GetDatamembers(TCppScope_t scope,
++                                   std::vector<TCppScope_t>& datamembers);
++
++void GetStaticDatamembers(TCppScope_t scope,
++                                         std::vector<TCppScope_t>& datamembers);
++
++TCppScope_t LookupDatamember(const std::string& name,
++                                            TCppScope_t parent);
++
++std::vector<TCppFunction_t>
++LookupMethods(const std::string& name, TCppScope_t parent);
++
++intptr_t GetVariableOffset(TCppScope_t var,
++                                          TCppScope_t parent = nullptr);
++
++bool IsProtectedVariable(TCppScope_t var);
++
++bool IsPrivateVariable(TCppScope_t var);
++
++bool IsStaticVariable(TCppScope_t var);
++
++bool IsNonStaticVariable(TCppScope_t var);
++
++bool IsConstType(TCppType_t type);
++
++bool IsPointerType(TCppType_t type);
++
++bool IsPointerToMemberType(TCppType_t type);
++
++bool IsPointerToMemberVariableType(TCppType_t type);
++
++bool IsPointerToMemberFunctionType(TCppType_t type);
++
++TCppType_t GetParentTypeFromPointerToMember(TCppType_t type);
++
++TCppType_t
++GetFunctionTypeFromPointerToMember(TCppType_t member_type, TCppType_t obj_type);
++
++bool IsArrayType(TCppType_t type);
++
++bool IsSizedArrayType(TCppType_t type);
++
++size_t GetArraySize(TCppType_t type);
++
++TCppType_t GetArrayElementType(TCppType_t type);
++
++TCppType_t GetArrayType(TCppType_t type);
++
++TCppType_t GetArrayType(TCppType_t type, size_t size);
++
++TCppType_t
++GetFunctionType(TCppType_t ret, std::vector<TCppType_t> const& params);
++
++TCppType_t GetPointeeType(TCppType_t type);
++
++TCppType_t GetPointerType(TCppType_t type);
++
++TCppType_t GetPointerToMemberType(TCppScope_t member);
++
++TCppType_t GetLValueReferenceType(TCppType_t type);
++
++TCppType_t GetRValueReferenceType(TCppType_t type);
++
++bool IsReferenceType(TCppType_t type);
++
++bool IsRvalueReferenceType(TCppType_t type);
++
++ValueKind GetValueKind(TCppType_t type);
++
++TCppType_t GetNonReferenceType(TCppType_t type);
++
++TCppType_t GetPointerType(TCppType_t type);
++
++TCppType_t GetUnderlyingType(TCppType_t type);
++
++TCppType_t GetTypeWithoutCv(TCppType_t type);
++
++TCppType_t GetTypeWithConst(TCppType_t type);
++
++TCppType_t GetTypeWithVolatile(TCppType_t type);
++
++TCppType_t GetSignedType(TCppType_t type);
++
++TCppType_t GetUnsignedType(TCppType_t type);
++
++TCppType_t GetShortType(TCppType_t type);
++
++TCppType_t GetLongType(TCppType_t type);
++
++bool IsShortType(TCppType_t type);
++
++std::string GetTypeAsString(TCppType_t type);
++
++std::string GetTypeAsTruncatedString(TCppType_t type);
++
++TCppType_t GetCanonicalType(TCppType_t type);
++
++TCppType_t GetType(const std::string& type);
++
++TCppType_t GetTypeFromScope(TCppScope_t klass);
++
++bool IsTypeDerivedFrom(TCppType_t derived, TCppType_t base);
++
++bool IsConstMethod(TCppFunction_t method);
++
++std::string GetFunctionArgName(TCppFunction_t func,
++                                              TCppIndex_t param_index);
++
++void GetOperator(Operator op,
++                                std::vector<TCppType_t> const& arg_types,
++                                std::vector<TCppFunction_t>& operators,
++                                OperatorArity kind);
++
++TCppType_t
++GetBuiltinOperatorType(Operator op,
++                       std::vector<TCppType_t> const& arg_types);
++
++TInterp_t
++CreateInterpreter(const std::vector<const char*>& Args = {},
++                  const std::vector<const char*>& GpuArgs = {},
++                  const std::map<char const*, std::string_view>& VFS = {},
++                  const std::optional<int>& CM = std::nullopt,
++                  bool* PCHOutOfDate = nullptr);
++
++bool DeleteInterpreter(TInterp_t I = nullptr);
++
++std::string
++DetectResourceDir(const char* ClangBinaryName = "clang");
++
++TCppScope_t
++InstantiateTemplate(TCppScope_t tmpl, const TemplateArgInfo* template_args,
++                    size_t template_args_size, bool instantiate_body = false);
++
++bool InstantiateTemplate(TCppScope_t spec);
++
++std::vector<TCppScope_t>
++BestOverloadMatch(const std::vector<TCppScope_t>& candidates,
++                  const std::vector<TCppType_t>& arg_types,
++                  const std::vector<TCppScope_t>& arg_scopes);
++
++OverloadCandidateInfo
++GetOverloadCandidateInfo(TCppScope_t candidate,
++                         const std::vector<TCppType_t>& arg_types,
++                         const std::vector<TCppScope_t>& arg_scopes);
++
++void DumpScope(TCppScope_t scope);
++
++} // namespace jank_cpp
++#endif
+--- a/compiler+runtime/include/cpp/jank/analyze/expr/cpp_builtin_operator_call.hpp
++++ b/compiler+runtime/include/cpp/jank/analyze/expr/cpp_builtin_operator_call.hpp
+@@ -27,7 +27,7 @@
+     void walk(std::function<void(jtl::ref<expression>)> const &f) override;
+     jtl::ptr<void> get_type() const override;
+ 
+-    /* Corresponds with Cpp::Operator. */
++    /* Corresponds with jank_cpp::Operator. */
+     int op{};
+     native_vector<expression_ref> arg_exprs;
+     jtl::ptr<void> type{};
+--- a/compiler+runtime/src/cpp/jank/analyze/cpp_util.cpp
++++ b/compiler+runtime/src/cpp/jank/analyze/cpp_util.cpp
+@@ -81,7 +81,7 @@
+   }
+ 
+   jtl::string_result<jtl::ptr<void>>
+-  instantiate(jtl::ptr<void> const scope, native_vector<Cpp::TemplateArgInfo> const &args)
++  instantiate(jtl::ptr<void> const scope, native_vector<jank_cpp::TemplateArgInfo> const &args)
+   {
+     auto const locked_interpreter{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+     auto &diag{ (*locked_interpreter)->getCompilerInstance()->getDiagnostics() };
+@@ -1230,7 +1230,7 @@
+     {
+       jtl::ptr<void> fn;
+       candidate_rank rank{};
+-      Cpp::OverloadCandidateInfo cand_info;
++      jank_cpp::OverloadCandidateInfo cand_info;
+     };
+ 
+     ranked_fn rank_candidate(jtl::ptr<void> const fn,
+@@ -1286,16 +1286,16 @@
+       {
+         switch(argument.m_Conversion)
+         {
+-          case Cpp::OverloadCandidateConversion::Invalid:
++          case jank_cpp::OverloadCandidateConversion::Invalid:
+             conversion_score += 3;
+             break;
+-          case Cpp::OverloadCandidateConversion::UserDefined:
++          case jank_cpp::OverloadCandidateConversion::UserDefined:
+             conversion_score += 2;
+             break;
+-          case Cpp::OverloadCandidateConversion::Implicit:
++          case jank_cpp::OverloadCandidateConversion::Implicit:
+             conversion_score += 1;
+             break;
+-          case Cpp::OverloadCandidateConversion::None:
++          case jank_cpp::OverloadCandidateConversion::None:
+             break;
+         }
+       }
+@@ -1640,10 +1640,10 @@
+     static auto const convert_template{ cppinterop::get_scope_from_complete_name(
+       "jank::runtime::convert") };
+     auto const locked_interpreter{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    Cpp::TemplateArgInfo const arg{ cppinterop::get_canonical_type(
++    jank_cpp::TemplateArgInfo const arg{ cppinterop::get_canonical_type(
+       cppinterop::get_type_without_cv(cppinterop::get_non_reference_type(type))) };
+     clang::Sema::SFINAETrap const trap{ (*locked_interpreter)->getSema(), true };
+-    Cpp::TCppScope_t instantiation{};
++    jank_cpp::TCppScope_t instantiation{};
+     {
+       auto &diag{ (*locked_interpreter)->getCompilerInstance()->getDiagnostics() };
+       auto old_client{ diag.takeClient() };
+@@ -1667,46 +1667,46 @@
+     return offset;
+   }
+ 
+-  jtl::option<Cpp::Operator> match_operator(jtl::immutable_string const &name)
+-  {
+-    static native_unordered_map<jtl::immutable_string, Cpp::Operator> const operators{
+-      {    "+",                Cpp::OP_Plus },
+-      {    "-",               Cpp::OP_Minus },
+-      {    "*",                Cpp::OP_Star },
+-      {    "/",               Cpp::OP_Slash },
+-      {    "%",             Cpp::OP_Percent },
+-      {   "++",            Cpp::OP_PlusPlus },
+-      {   "--",          Cpp::OP_MinusMinus },
+-      {   "==",          Cpp::OP_EqualEqual },
+-      {   "!=",        Cpp::OP_ExclaimEqual },
+-      {    ">",             Cpp::OP_Greater },
+-      {    "<",                Cpp::OP_Less },
+-      {   ">=",        Cpp::OP_GreaterEqual },
+-      {   "<=",           Cpp::OP_LessEqual },
+-      {  "<=>",           Cpp::OP_Spaceship },
+-      {    "!",             Cpp::OP_Exclaim },
+-      {   "&&",              Cpp::OP_AmpAmp },
+-      {   "||",            Cpp::OP_PipePipe },
+-      {    "~",               Cpp::OP_Tilde },
+-      {    "&",                 Cpp::OP_Amp },
+-      {    "|",                Cpp::OP_Pipe },
+-      {    "^",               Cpp::OP_Caret },
+-      {   "<<",            Cpp::OP_LessLess },
+-      {   ">>",      Cpp::OP_GreaterGreater },
+-      {    "=",               Cpp::OP_Equal },
+-      {   "+=",           Cpp::OP_PlusEqual },
+-      {   "-=",          Cpp::OP_MinusEqual },
+-      {   "*=",           Cpp::OP_StarEqual },
+-      {   "/=",          Cpp::OP_SlashEqual },
+-      {   "%=",        Cpp::OP_PercentEqual },
+-      {   "&=",            Cpp::OP_AmpEqual },
+-      {   "|=",           Cpp::OP_PipeEqual },
+-      {   "^=",          Cpp::OP_CaretEqual },
+-      {  "<<=",       Cpp::OP_LessLessEqual },
+-      {  ">>=", Cpp::OP_GreaterGreaterEqual },
+-      { "aget",           Cpp::OP_Subscript },
++  jtl::option<jank_cpp::Operator> match_operator(jtl::immutable_string const &name)
++  {
++    static native_unordered_map<jtl::immutable_string, jank_cpp::Operator> const operators{
++      {    "+",                jank_cpp::OP_Plus },
++      {    "-",               jank_cpp::OP_Minus },
++      {    "*",                jank_cpp::OP_Star },
++      {    "/",               jank_cpp::OP_Slash },
++      {    "%",             jank_cpp::OP_Percent },
++      {   "++",            jank_cpp::OP_PlusPlus },
++      {   "--",          jank_cpp::OP_MinusMinus },
++      {   "==",          jank_cpp::OP_EqualEqual },
++      {   "!=",        jank_cpp::OP_ExclaimEqual },
++      {    ">",             jank_cpp::OP_Greater },
++      {    "<",                jank_cpp::OP_Less },
++      {   ">=",        jank_cpp::OP_GreaterEqual },
++      {   "<=",           jank_cpp::OP_LessEqual },
++      {  "<=>",           jank_cpp::OP_Spaceship },
++      {    "!",             jank_cpp::OP_Exclaim },
++      {   "&&",              jank_cpp::OP_AmpAmp },
++      {   "||",            jank_cpp::OP_PipePipe },
++      {    "~",               jank_cpp::OP_Tilde },
++      {    "&",                 jank_cpp::OP_Amp },
++      {    "|",                jank_cpp::OP_Pipe },
++      {    "^",               jank_cpp::OP_Caret },
++      {   "<<",            jank_cpp::OP_LessLess },
++      {   ">>",      jank_cpp::OP_GreaterGreater },
++      {    "=",               jank_cpp::OP_Equal },
++      {   "+=",           jank_cpp::OP_PlusEqual },
++      {   "-=",          jank_cpp::OP_MinusEqual },
++      {   "*=",           jank_cpp::OP_StarEqual },
++      {   "/=",          jank_cpp::OP_SlashEqual },
++      {   "%=",        jank_cpp::OP_PercentEqual },
++      {   "&=",            jank_cpp::OP_AmpEqual },
++      {   "|=",           jank_cpp::OP_PipeEqual },
++      {   "^=",          jank_cpp::OP_CaretEqual },
++      {  "<<=",       jank_cpp::OP_LessLessEqual },
++      {  ">>=", jank_cpp::OP_GreaterGreaterEqual },
++      { "aget",           jank_cpp::OP_Subscript },
+       /* This is not accessible through jank's syntax, but we use it internally. */
+-      {   "()",                Cpp::OP_Call }
++      {   "()",                jank_cpp::OP_Call }
+     };
+ 
+     auto const op{ operators.find(name) };
+@@ -1717,45 +1717,45 @@
+     return none;
+   }
+ 
+-  jtl::option<jtl::immutable_string> operator_name(Cpp::Operator const op)
+-  {
+-    static native_unordered_map<Cpp::Operator, jtl::immutable_string> const operators{
+-      {                Cpp::OP_Plus,    "+" },
+-      {               Cpp::OP_Minus,    "-" },
+-      {                Cpp::OP_Star,    "*" },
+-      {               Cpp::OP_Slash,    "/" },
+-      {             Cpp::OP_Percent,    "%" },
+-      {            Cpp::OP_PlusPlus,   "++" },
+-      {          Cpp::OP_MinusMinus,   "--" },
+-      {          Cpp::OP_EqualEqual,   "==" },
+-      {        Cpp::OP_ExclaimEqual,   "!=" },
+-      {             Cpp::OP_Greater,    ">" },
+-      {                Cpp::OP_Less,    "<" },
+-      {        Cpp::OP_GreaterEqual,   ">=" },
+-      {           Cpp::OP_LessEqual,   "<=" },
+-      {           Cpp::OP_Spaceship,  "<=>" },
+-      {             Cpp::OP_Exclaim,    "!" },
+-      {              Cpp::OP_AmpAmp,   "&&" },
+-      {            Cpp::OP_PipePipe,   "||" },
+-      {               Cpp::OP_Tilde,    "~" },
+-      {                 Cpp::OP_Amp,    "&" },
+-      {                Cpp::OP_Pipe,    "|" },
+-      {               Cpp::OP_Caret,    "^" },
+-      {            Cpp::OP_LessLess,   "<<" },
+-      {      Cpp::OP_GreaterGreater,   ">>" },
+-      {               Cpp::OP_Equal,    "=" },
+-      {           Cpp::OP_PlusEqual,   "+=" },
+-      {          Cpp::OP_MinusEqual,   "-=" },
+-      {           Cpp::OP_StarEqual,   "*=" },
+-      {          Cpp::OP_SlashEqual,   "/=" },
+-      {        Cpp::OP_PercentEqual,   "%=" },
+-      {            Cpp::OP_AmpEqual,   "&=" },
+-      {           Cpp::OP_PipeEqual,   "|=" },
+-      {          Cpp::OP_CaretEqual,   "^=" },
+-      {       Cpp::OP_LessLessEqual,  "<<=" },
+-      { Cpp::OP_GreaterGreaterEqual,  ">>=" },
+-      {           Cpp::OP_Subscript, "aget" },
+-      {                Cpp::OP_Call,   "()" }
++  jtl::option<jtl::immutable_string> operator_name(jank_cpp::Operator const op)
++  {
++    static native_unordered_map<jank_cpp::Operator, jtl::immutable_string> const operators{
++      {                jank_cpp::OP_Plus,    "+" },
++      {               jank_cpp::OP_Minus,    "-" },
++      {                jank_cpp::OP_Star,    "*" },
++      {               jank_cpp::OP_Slash,    "/" },
++      {             jank_cpp::OP_Percent,    "%" },
++      {            jank_cpp::OP_PlusPlus,   "++" },
++      {          jank_cpp::OP_MinusMinus,   "--" },
++      {          jank_cpp::OP_EqualEqual,   "==" },
++      {        jank_cpp::OP_ExclaimEqual,   "!=" },
++      {             jank_cpp::OP_Greater,    ">" },
++      {                jank_cpp::OP_Less,    "<" },
++      {        jank_cpp::OP_GreaterEqual,   ">=" },
++      {           jank_cpp::OP_LessEqual,   "<=" },
++      {           jank_cpp::OP_Spaceship,  "<=>" },
++      {             jank_cpp::OP_Exclaim,    "!" },
++      {              jank_cpp::OP_AmpAmp,   "&&" },
++      {            jank_cpp::OP_PipePipe,   "||" },
++      {               jank_cpp::OP_Tilde,    "~" },
++      {                 jank_cpp::OP_Amp,    "&" },
++      {                jank_cpp::OP_Pipe,    "|" },
++      {               jank_cpp::OP_Caret,    "^" },
++      {            jank_cpp::OP_LessLess,   "<<" },
++      {      jank_cpp::OP_GreaterGreater,   ">>" },
++      {               jank_cpp::OP_Equal,    "=" },
++      {           jank_cpp::OP_PlusEqual,   "+=" },
++      {          jank_cpp::OP_MinusEqual,   "-=" },
++      {           jank_cpp::OP_StarEqual,   "*=" },
++      {          jank_cpp::OP_SlashEqual,   "/=" },
++      {        jank_cpp::OP_PercentEqual,   "%=" },
++      {            jank_cpp::OP_AmpEqual,   "&=" },
++      {           jank_cpp::OP_PipeEqual,   "|=" },
++      {          jank_cpp::OP_CaretEqual,   "^=" },
++      {       jank_cpp::OP_LessLessEqual,  "<<=" },
++      { jank_cpp::OP_GreaterGreaterEqual,  ">>=" },
++      {           jank_cpp::OP_Subscript, "aget" },
++      {                jank_cpp::OP_Call,   "()" }
+     };
+ 
+     auto const name{ operators.find(op) };
+--- a/compiler+runtime/src/cpp/jank/analyze/cppinterop.cpp
++++ b/compiler+runtime/src/cpp/jank/analyze/cppinterop.cpp
+@@ -1,6 +1,6 @@
+ #include <mutex>
+ 
+-#include <CppInterOp/CppInterOp.h>
++#include <jank/analyze/cppinterop_extensions.hpp>
+ 
+ #include <jank/analyze/cppinterop.hpp>
+ #include <jank/runtime/context.hpp>
+@@ -17,9 +17,12 @@
+ {
+   namespace
+   {
+-    std::vector<void *> const &to_voidp(std::vector<clang_decl> const &handles)
++    std::vector<void *> to_voidp(std::vector<clang_decl> const &handles)
+     {
+-      return *reinterpret_cast<std::vector<void *> const *>(&handles);
++      std::vector<void *> result;
++      result.reserve(handles.size());
++      for(auto const handle : handles) result.emplace_back(handle.data);
++      return result;
+     }
+ 
+     std::vector<clang_decl> from_voidp(std::vector<void *> const &handles)
+@@ -37,361 +40,361 @@
+   std::string mangle_rtti(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::MangleRTTI(type);
++    return jank_cpp::MangleRTTI(type);
+   }
+ 
+   void enable_debug_output(bool value)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    Cpp::EnableDebugOutput(value);
++    jank_cpp::EnableDebugOutput(value);
+   }
+ 
+   void dump(clang_decl scope)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    Cpp::DumpScope(scope);
++    jank_cpp::DumpScope(scope);
+   }
+ 
+   bool is_namespace(clang_decl scope)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsNamespace(scope);
++    return jank_cpp::IsNamespace(scope);
+   }
+ 
+   bool is_class(clang_decl scope)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsClass(scope);
++    return jank_cpp::IsClass(scope);
+   }
+ 
+   bool is_class_template(clang_decl handle)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsClassTemplate(handle);
++    return jank_cpp::IsClassTemplate(handle);
+   }
+ 
+   bool is_function(clang_decl scope)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsFunction(scope);
++    return jank_cpp::IsFunction(scope);
+   }
+ 
+   bool is_function_pointer_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsFunctionPointerType(type);
++    return jank_cpp::IsFunctionPointerType(type);
+   }
+ 
+   bool is_inline_friend_function(clang_decl scope)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsInlineFriendFunction(scope);
++    return jank_cpp::IsInlineFriendFunction(scope);
+   }
+ 
+   bool is_complete(clang_decl scope)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsComplete(scope);
++    return jank_cpp::IsComplete(scope);
+   }
+ 
+   bool is_builtin(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsBuiltin(type);
++    return jank_cpp::IsBuiltin(type);
+   }
+ 
+   bool is_integral(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsIntegral(type);
++    return jank_cpp::IsIntegral(type);
+   }
+ 
+   bool is_void(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsVoid(type);
++    return jank_cpp::IsVoid(type);
+   }
+ 
+   clang_type get_void_type()
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetVoidType();
++    return jank_cpp::GetVoidType();
+   }
+ 
+   bool is_template(clang_decl handle)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsTemplate(handle);
++    return jank_cpp::IsTemplate(handle);
+   }
+ 
+   bool is_template_specialization(clang_decl handle)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsTemplateSpecialization(handle);
++    return jank_cpp::IsTemplateSpecialization(handle);
+   }
+ 
+   bool is_template_specialization_of(clang_decl spec, clang_decl templ)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsTemplateSpecializationOf(spec, templ);
++    return jank_cpp::IsTemplateSpecializationOf(spec, templ);
+   }
+ 
+   bool is_typedefed(clang_decl handle)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsTypedefed(handle);
++    return jank_cpp::IsTypedefed(handle);
+   }
+ 
+   clang_type get_common_type(clang_type lhs, clang_type rhs)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetCommonType(lhs, rhs);
++    return jank_cpp::GetCommonType(lhs, rhs);
+   }
+ 
+   bool is_implicitly_convertible(clang_type from_type, clang_type to_type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsImplicitlyConvertible(from_type, to_type);
++    return jank_cpp::IsImplicitlyConvertible(from_type, to_type);
+   }
+ 
+   bool is_c_style_convertible(clang_type from_type, clang_type to_type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsCStyleConvertible(from_type, to_type);
++    return jank_cpp::IsCStyleConvertible(from_type, to_type);
+   }
+ 
+   bool is_constructible(clang_type to_type, clang_type from_type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsConstructible(to_type, from_type);
++    return jank_cpp::IsConstructible(to_type, from_type);
+   }
+ 
+   bool is_trivially_destructible(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsTriviallyDestructible(type);
++    return jank_cpp::IsTriviallyDestructible(type);
+   }
+ 
+   bool is_enum_scope(clang_decl handle)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsEnumScope(handle);
++    return jank_cpp::IsEnumScope(handle);
+   }
+ 
+   bool is_enum_constant(clang_decl handle)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsEnumConstant(handle);
++    return jank_cpp::IsEnumConstant(handle);
+   }
+ 
+   bool is_enum_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsEnumType(type);
++    return jank_cpp::IsEnumType(type);
+   }
+ 
+   bool has_type_qualifier(clang_type type, qualifier q)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::HasTypeQualifier(type, static_cast<Cpp::QualKind>(q));
++    return jank_cpp::HasTypeQualifier(type, static_cast<jank_cpp::QualKind>(q));
+   }
+ 
+   bool is_variable(clang_decl scope)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsVariable(scope);
++    return jank_cpp::IsVariable(scope);
+   }
+ 
+   std::string get_name(clang_decl klass)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetName(klass);
++    return jank_cpp::GetName(klass);
+   }
+ 
+   std::string get_qualified_name(clang_decl klass)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetQualifiedName(klass);
++    return jank_cpp::GetQualifiedName(klass);
+   }
+ 
+   std::string get_qualified_complete_name(clang_decl klass)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetQualifiedCompleteName(klass);
++    return jank_cpp::GetQualifiedCompleteName(klass);
+   }
+ 
+   std::string get_truncated_name(clang_decl klass)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetTruncatedName(klass);
++    return jank_cpp::GetTruncatedName(klass);
+   }
+ 
+   std::string get_qualified_complete_name_with_template_args(clang_decl klass)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetQualifiedCompleteNameWithTemplateArgs(klass);
++    return jank_cpp::GetQualifiedCompleteNameWithTemplateArgs(klass);
+   }
+ 
+   clang_decl get_global_scope()
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetGlobalScope();
++    return jank_cpp::GetGlobalScope();
+   }
+ 
+   clang_decl get_underlying_scope(clang_decl scope)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetUnderlyingScope(scope);
++    return jank_cpp::GetUnderlyingScope(scope);
+   }
+ 
+   clang_decl get_scope_from_complete_name(std::string const &name)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetScopeFromCompleteName(name);
++    return jank_cpp::GetScopeFromCompleteName(name);
+   }
+ 
+   clang_decl get_named(std::string const &name, clang_decl parent)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetNamed(name, parent);
++    return jank_cpp::GetNamed(name, parent);
+   }
+ 
+   clang_decl get_parent_scope(clang_decl scope)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetParentScope(scope);
++    return jank_cpp::GetParentScope(scope);
+   }
+ 
+   clang_decl get_scope_from_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetScopeFromType(type);
++    return jank_cpp::GetScopeFromType(type);
+   }
+ 
+   size_t get_num_bases(clang_decl klass)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetNumBases(klass);
++    return jank_cpp::GetNumBases(klass);
+   }
+ 
+   clang_decl get_base_class(clang_decl klass, size_t ibase)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetBaseClass(klass, ibase);
++    return jank_cpp::GetBaseClass(klass, ibase);
+   }
+ 
+   bool has_usable_copy_constructor(clang_decl scope)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::HasUsableCopyConstructor(scope);
++    return jank_cpp::HasUsableCopyConstructor(scope);
+   }
+ 
+   bool has_usable_move_constructor(clang_decl scope)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::HasUsableMoveConstructor(scope);
++    return jank_cpp::HasUsableMoveConstructor(scope);
+   }
+ 
+   bool has_deleted_move_constructor(clang_decl scope)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::HasDeletedMoveConstructor(scope);
++    return jank_cpp::HasDeletedMoveConstructor(scope);
+   }
+ 
+   std::vector<clang_decl> get_functions_using_name(clang_decl scope, std::string const &name)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return from_voidp(Cpp::GetFunctionsUsingName(scope, name));
++    return from_voidp(jank_cpp::GetFunctionsUsingName(scope, name));
+   }
+ 
+   clang_type get_function_return_type(clang_decl func)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetFunctionReturnType(func);
++    return jank_cpp::GetFunctionReturnType(func);
+   }
+ 
+   size_t get_function_num_args(clang_decl func)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetFunctionNumArgs(func);
++    return jank_cpp::GetFunctionNumArgs(func);
+   }
+ 
+   size_t get_function_required_args(clang_decl func)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetFunctionRequiredArgs(func);
++    return jank_cpp::GetFunctionRequiredArgs(func);
+   }
+ 
+   clang_type get_function_arg_type(clang_decl func, size_t iarg)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetFunctionArgType(func, iarg);
++    return jank_cpp::GetFunctionArgType(func, iarg);
+   }
+ 
+   std::string get_function_signature(clang_type func)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetFunctionSignature(func);
++    return jank_cpp::GetFunctionSignature(func);
+   }
+ 
+   std::string get_function_source_info(clang_decl func)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetFunctionSourceInfo(func);
++    return jank_cpp::GetFunctionSourceInfo(func);
+   }
+ 
+   clang_type get_function_return_type_from_type(clang_type func)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetFunctionReturnTypeFromType(func);
++    return jank_cpp::GetFunctionReturnTypeFromType(func);
+   }
+ 
+   size_t get_function_num_args_from_type(clang_type func)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetFunctionNumArgsFromType(func);
++    return jank_cpp::GetFunctionNumArgsFromType(func);
+   }
+ 
+   clang_type get_function_arg_type_from_type(clang_type func, size_t iarg)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetFunctionArgTypeFromType(func, iarg);
++    return jank_cpp::GetFunctionArgTypeFromType(func, iarg);
+   }
+ 
+   bool is_function_variadic(clang_decl function)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsFunctionVariadic(function);
++    return jank_cpp::IsFunctionVariadic(function);
+   }
+ 
+   bool is_function_variadic_template(clang_decl fn)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsFunctionVariadicTemplate(fn);
++    return jank_cpp::IsFunctionVariadicTemplate(fn);
+   }
+ 
+   bool is_function_deleted(clang_decl function)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsFunctionDeleted(function);
++    return jank_cpp::IsFunctionDeleted(function);
+   }
+ 
+   bool is_function_type_const(clang_type function_type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsFunctionTypeConst(function_type);
++    return jank_cpp::IsFunctionTypeConst(function_type);
+   }
+ 
+   bool is_templated_function(clang_decl func)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsTemplatedFunction(func);
++    return jank_cpp::IsTemplatedFunction(func);
+   }
+ 
+   bool is_bodyless_function_template_specialization(clang_decl func)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsBodylessFunctionTemplateSpecialization(func);
++    return jank_cpp::IsBodylessFunctionTemplateSpecialization(func);
+   }
+ 
+   void
+@@ -399,51 +402,51 @@
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+     std::vector<void *> cpp_funcs;
+-    Cpp::LookupConstructors(name, parent, cpp_funcs);
++    jank_cpp::LookupConstructors(name, parent, cpp_funcs);
+     funcs = from_voidp(cpp_funcs);
+   }
+ 
+   bool is_method(clang_decl method)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsMethod(method);
++    return jank_cpp::IsMethod(method);
+   }
+ 
+   bool is_protected_method(clang_decl method)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsProtectedMethod(method);
++    return jank_cpp::IsProtectedMethod(method);
+   }
+ 
+   bool is_private_method(clang_decl method)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsPrivateMethod(method);
++    return jank_cpp::IsPrivateMethod(method);
+   }
+ 
+   bool is_constructor(clang_decl method)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsConstructor(method);
++    return jank_cpp::IsConstructor(method);
+   }
+ 
+   bool is_destructor(clang_decl method)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsDestructor(method);
++    return jank_cpp::IsDestructor(method);
+   }
+ 
+   bool is_static_method(clang_decl method)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsStaticMethod(method);
++    return jank_cpp::IsStaticMethod(method);
+   }
+ 
+   void get_datamembers(clang_decl scope, std::vector<clang_decl> &datamembers)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+     std::vector<void *> cpp_datamembers;
+-    Cpp::GetDatamembers(scope, cpp_datamembers);
++    jank_cpp::GetDatamembers(scope, cpp_datamembers);
+     datamembers = from_voidp(cpp_datamembers);
+   }
+ 
+@@ -451,308 +454,308 @@
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+     std::vector<void *> cpp_datamembers;
+-    Cpp::GetStaticDatamembers(scope, cpp_datamembers);
++    jank_cpp::GetStaticDatamembers(scope, cpp_datamembers);
+     datamembers = from_voidp(cpp_datamembers);
+   }
+ 
+   clang_decl lookup_datamember(std::string const &name, clang_decl parent)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::LookupDatamember(name, parent);
++    return jank_cpp::LookupDatamember(name, parent);
+   }
+ 
+   std::vector<clang_decl> lookup_methods(std::string const &name, clang_decl parent)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return from_voidp(Cpp::LookupMethods(name, parent));
++    return from_voidp(jank_cpp::LookupMethods(name, parent));
+   }
+ 
+   intptr_t get_variable_offset(clang_decl var, clang_decl parent)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetVariableOffset(var, parent);
++    return jank_cpp::GetVariableOffset(var, parent);
+   }
+ 
+   bool is_protected_variable(clang_decl var)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsProtectedVariable(var);
++    return jank_cpp::IsProtectedVariable(var);
+   }
+ 
+   bool is_private_variable(clang_decl var)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsPrivateVariable(var);
++    return jank_cpp::IsPrivateVariable(var);
+   }
+ 
+   bool is_static_variable(clang_decl var)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsStaticVariable(var);
++    return jank_cpp::IsStaticVariable(var);
+   }
+ 
+   bool is_non_static_variable(clang_decl scope)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsNonStaticVariable(scope);
++    return jank_cpp::IsNonStaticVariable(scope);
+   }
+ 
+   bool is_const_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsConstType(type);
++    return jank_cpp::IsConstType(type);
+   }
+ 
+   bool is_pointer_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsPointerType(type);
++    return jank_cpp::IsPointerType(type);
+   }
+ 
+   bool is_pointer_to_member_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsPointerToMemberType(type);
++    return jank_cpp::IsPointerToMemberType(type);
+   }
+ 
+   bool is_pointer_to_member_variable_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsPointerToMemberVariableType(type);
++    return jank_cpp::IsPointerToMemberVariableType(type);
+   }
+ 
+   bool is_pointer_to_member_function_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsPointerToMemberFunctionType(type);
++    return jank_cpp::IsPointerToMemberFunctionType(type);
+   }
+ 
+   clang_type get_parent_type_from_pointer_to_member(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetParentTypeFromPointerToMember(type);
++    return jank_cpp::GetParentTypeFromPointerToMember(type);
+   }
+ 
+   clang_type get_function_type_from_pointer_to_member(clang_type member_type, clang_type obj_type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetFunctionTypeFromPointerToMember(member_type, obj_type);
++    return jank_cpp::GetFunctionTypeFromPointerToMember(member_type, obj_type);
+   }
+ 
+   bool is_array_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsArrayType(type);
++    return jank_cpp::IsArrayType(type);
+   }
+ 
+   bool is_sized_array_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsSizedArrayType(type);
++    return jank_cpp::IsSizedArrayType(type);
+   }
+ 
+   size_t get_array_size(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetArraySize(type);
++    return jank_cpp::GetArraySize(type);
+   }
+ 
+   clang_type get_array_element_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetArrayElementType(type);
++    return jank_cpp::GetArrayElementType(type);
+   }
+ 
+   clang_type get_array_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetArrayType(type);
++    return jank_cpp::GetArrayType(type);
+   }
+ 
+   clang_type get_array_type(clang_type type, size_t size)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetArrayType(type, size);
++    return jank_cpp::GetArrayType(type, size);
+   }
+ 
+   clang_type get_function_type(clang_type ret, std::vector<clang_type> const &params)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetFunctionType(ret, to_voidp(params));
++    return jank_cpp::GetFunctionType(ret, to_voidp(params));
+   }
+ 
+   clang_type get_pointee_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetPointeeType(type);
++    return jank_cpp::GetPointeeType(type);
+   }
+ 
+   clang_type get_pointer_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetPointerType(type);
++    return jank_cpp::GetPointerType(type);
+   }
+ 
+   clang_type get_pointer_to_member_type(clang_decl member)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetPointerToMemberType(member);
++    return jank_cpp::GetPointerToMemberType(member);
+   }
+ 
+   clang_type get_lvalue_reference_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetLValueReferenceType(type);
++    return jank_cpp::GetLValueReferenceType(type);
+   }
+ 
+   clang_type get_rvalue_reference_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetRValueReferenceType(type);
++    return jank_cpp::GetRValueReferenceType(type);
+   }
+ 
+   bool is_reference_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsReferenceType(type);
++    return jank_cpp::IsReferenceType(type);
+   }
+ 
+   bool is_rvalue_reference_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsRvalueReferenceType(type);
++    return jank_cpp::IsRvalueReferenceType(type);
+   }
+ 
+   value_category get_value_category(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return static_cast<value_category>(Cpp::GetValueKind(type));
++    return static_cast<value_category>(jank_cpp::GetValueKind(type));
+   }
+ 
+   clang_type get_non_reference_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetNonReferenceType(type);
++    return jank_cpp::GetNonReferenceType(type);
+   }
+ 
+   clang_type get_underlying_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetUnderlyingType(type);
++    return jank_cpp::GetUnderlyingType(type);
+   }
+ 
+   clang_type get_type_without_cv(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetTypeWithoutCv(type);
++    return jank_cpp::GetTypeWithoutCv(type);
+   }
+ 
+   clang_type get_type_with_const(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetTypeWithConst(type);
++    return jank_cpp::GetTypeWithConst(type);
+   }
+ 
+   clang_type get_type_with_volatile(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetTypeWithVolatile(type);
++    return jank_cpp::GetTypeWithVolatile(type);
+   }
+ 
+   clang_type get_signed_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetSignedType(type);
++    return jank_cpp::GetSignedType(type);
+   }
+ 
+   clang_type get_unsigned_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetUnsignedType(type);
++    return jank_cpp::GetUnsignedType(type);
+   }
+ 
+   clang_type get_short_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetShortType(type);
++    return jank_cpp::GetShortType(type);
+   }
+ 
+   clang_type get_long_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetLongType(type);
++    return jank_cpp::GetLongType(type);
+   }
+ 
+   bool is_short_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsShortType(type);
++    return jank_cpp::IsShortType(type);
+   }
+ 
+   std::string get_type_as_string(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetTypeAsString(type);
++    return jank_cpp::GetTypeAsString(type);
+   }
+ 
+   std::string get_type_as_truncated_string(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetTypeAsTruncatedString(type);
++    return jank_cpp::GetTypeAsTruncatedString(type);
+   }
+ 
+   clang_type get_canonical_type(clang_type type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetCanonicalType(type);
++    return jank_cpp::GetCanonicalType(type);
+   }
+ 
+   clang_type get_type(std::string const &type)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetType(type);
++    return jank_cpp::GetType(type);
+   }
+ 
+   clang_type get_type_from_scope(clang_decl klass)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetTypeFromScope(klass);
++    return jank_cpp::GetTypeFromScope(klass);
+   }
+ 
+   bool is_type_derived_from(clang_type derived, clang_type base)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsTypeDerivedFrom(derived, base);
++    return jank_cpp::IsTypeDerivedFrom(derived, base);
+   }
+ 
+   bool is_const_method(clang_decl method)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::IsConstMethod(method);
++    return jank_cpp::IsConstMethod(method);
+   }
+ 
+   std::string get_function_arg_name(clang_decl func, size_t param_index)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetFunctionArgName(func, param_index);
+-  }
+-
+-  void get_operator(CppImpl::Operator op,
++    return jank_cpp::GetFunctionArgName(func, param_index);
++  }
++
++  void get_operator(jank_cpp::Operator op,
+                     std::vector<clang_type> const &arg_types,
+                     std::vector<clang_decl> &operators,
+-                    CppImpl::OperatorArity kind)
++                    jank_cpp::OperatorArity kind)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+     std::vector<void *> cpp_operators;
+-    Cpp::GetOperator(op, to_voidp(arg_types), cpp_operators, kind);
++    jank_cpp::GetOperator(op, to_voidp(arg_types), cpp_operators, kind);
+     operators = from_voidp(cpp_operators);
+   }
+ 
+   clang_type
+-  get_builtin_operator_type(CppImpl::Operator op, std::vector<clang_type> const &arg_types)
+-  {
+-    auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetBuiltinOperatorType(op, to_voidp(arg_types));
++  get_builtin_operator_type(jank_cpp::Operator op, std::vector<clang_type> const &arg_types)
++  {
++    auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
++    return jank_cpp::GetBuiltinOperatorType(op, to_voidp(arg_types));
+   }
+ 
+   clang_decl create_interpreter(std::vector<char const *> const &args,
+@@ -762,29 +765,29 @@
+                                 bool *pch_out_of_date)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::CreateInterpreter(args, gpu_args, vfs, cm, pch_out_of_date);
++    return jank_cpp::CreateInterpreter(args, gpu_args, vfs, cm, pch_out_of_date);
+   }
+ 
+   // Deliberately unlocked: this only spawns an external clang process and touches no Sema or
+   // ASTContext state, so it should not block interpreter work on other threads.
+   std::string detect_resource_dir(char const *clang_binary_name)
+   {
+-    return Cpp::DetectResourceDir(clang_binary_name);
++    return jank_cpp::DetectResourceDir(clang_binary_name);
+   }
+ 
+   clang_decl instantiate_template(clang_decl tmpl,
+-                                  CppImpl::TemplateArgInfo const *template_args,
++                                  jank_cpp::TemplateArgInfo const *template_args,
+                                   size_t template_args_size,
+                                   bool instantiate_body)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::InstantiateTemplate(tmpl, template_args, template_args_size, instantiate_body);
++    return jank_cpp::InstantiateTemplate(tmpl, template_args, template_args_size, instantiate_body);
+   }
+ 
+   bool instantiate_template(clang_decl spec)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::InstantiateTemplate(spec);
++    return jank_cpp::InstantiateTemplate(spec);
+   }
+ 
+   std::vector<clang_decl> best_overload_match(std::vector<clang_decl> const &candidates,
+@@ -793,15 +796,15 @@
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+     return from_voidp(
+-      Cpp::BestOverloadMatch(to_voidp(candidates), to_voidp(arg_types), to_voidp(arg_scopes)));
+-  }
+-
+-  CppImpl::OverloadCandidateInfo
++      jank_cpp::BestOverloadMatch(to_voidp(candidates), to_voidp(arg_types), to_voidp(arg_scopes)));
++  }
++
++  jank_cpp::OverloadCandidateInfo
+   get_overload_candidate_info(clang_decl candidate,
+                               std::vector<clang_type> const &arg_types,
+                               std::vector<clang_decl> const &arg_scopes)
+   {
+     auto const lock{ runtime::__rt_ctx->jit_prc.interpreter.lock() };
+-    return Cpp::GetOverloadCandidateInfo(candidate, to_voidp(arg_types), to_voidp(arg_scopes));
++    return jank_cpp::GetOverloadCandidateInfo(candidate, to_voidp(arg_types), to_voidp(arg_scopes));
+   }
+ }
+--- /dev/null
++++ b/compiler+runtime/src/cpp/jank/analyze/cppinterop_extensions.cpp
+@@ -0,0 +1,2882 @@
++//--------------------------------------------------------------------*- C++ -*-
++// CLING - the C++ LLVM-based InterpreterG :)
++// author:  Vassil Vassilev <vvasilev@cern.ch>
++//
++// This file is dual-licensed: you can choose to license it under the University
++// of Illinois Open Source License or the GNU Lesser General Public License. See
++// LICENSE.TXT for details.
++//------------------------------------------------------------------------------
++
++#include <jank/analyze/cppinterop_extensions.hpp>
++#include <CppInterOp/Compatibility.h>
++#include <clang/Basic/DiagnosticSerialization.h>
++#include <llvm/Support/DynamicLibrary.h>
++
++#include "clang/AST/Attrs.inc"
++#include "clang/AST/CXXInheritance.h"
++#include "clang/AST/Comment.h"
++#include "clang/AST/Decl.h"
++#include "clang/AST/DeclAccessPair.h"
++#include "clang/AST/DeclBase.h"
++#include "clang/AST/DeclCXX.h"
++#include "clang/AST/DeclFriend.h"
++#include "clang/AST/DeclarationName.h"
++#include "clang/AST/Expr.h"
++#include "clang/AST/ExprCXX.h"
++#include "clang/AST/GlobalDecl.h"
++#include "clang/AST/Mangle.h"
++#include "clang/AST/NestedNameSpecifier.h"
++#include "clang/AST/QualTypeNames.h"
++#include "clang/AST/RawCommentList.h"
++#include "clang/AST/RecordLayout.h"
++#include "clang/AST/RecursiveASTVisitor.h"
++#include "clang/AST/Stmt.h"
++#include "clang/AST/Type.h"
++#include "clang/Basic/DiagnosticSema.h"
++#include "clang/Basic/Linkage.h"
++#include "clang/Basic/OperatorKinds.h"
++#include "clang/Basic/SourceLocation.h"
++#include "clang/Basic/SourceManager.h"
++#include "clang/Basic/Specifiers.h"
++#include "clang/Basic/Version.h"
++#include "clang/Frontend/CompilerInstance.h"
++#include "clang/Interpreter/Interpreter.h"
++#include "clang/Sema/Lookup.h"
++#include "clang/Sema/Overload.h"
++#include "clang/Sema/Ownership.h"
++#include "clang/Sema/Redeclaration.h"
++#include "clang/Sema/Sema.h"
++#include "clang/Sema/TemplateDeduction.h"
++
++#include "llvm/ADT/SmallString.h"
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/ADT/StringRef.h"
++#include "llvm/Demangle/Demangle.h"
++#if CLANG_VERSION_MAJOR >= 20
++#include "llvm/ExecutionEngine/Orc/AbsoluteSymbols.h"
++#include "llvm/ExecutionEngine/Orc/CoreContainers.h"
++#endif
++#include "llvm/ExecutionEngine/Orc/Core.h"
++#include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
++#include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
++#include "llvm/IR/GlobalValue.h"
++#include "llvm/Support/Casting.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/Error.h"
++#include "llvm/Support/FileSystem.h"
++#include "llvm/Support/ManagedStatic.h"
++#include "llvm/Support/Path.h"
++#include "llvm/Support/raw_ostream.h"
++#include "llvm/TargetParser/Host.h"
++#include "llvm/TargetParser/Triple.h"
++#include <algorithm>
++#include <cassert>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <deque>
++#include <iostream>
++#include <iterator>
++#include <map>
++#include <memory>
++#include <set>
++#include <sstream>
++#include <stack>
++#include <string>
++#include <sys/types.h>
++#ifndef _WIN32
++#include <unistd.h>
++#endif
++#include <utility>
++// Stream redirect.
++#ifdef _WIN32
++#include <io.h>
++#ifndef STDOUT_FILENO
++#define STDOUT_FILENO 1
++#define STDERR_FILENO 2
++// For exec().
++#include <stdio.h>
++#define popen(x, y) (_popen(x, y))
++#define pclose (_pclose)
++#endif
++#else
++#include <dlfcn.h>
++#include <unistd.h>
++#endif // WIN32
++
++
++namespace jank_cpp {
++using namespace clang;
++using namespace llvm;
++static compat::Interpreter& getInterp() {
++  auto handle = Cpp::GetInterpreter();
++  assert(handle && "CppInterOp interpreter must be initialized");
++  return *static_cast<compat::Interpreter*>(handle.data);
++}
++static clang::Sema& getSema() { return getInterp().getCI()->getSema(); }
++static clang::ASTContext& getASTContext() { return getSema().getASTContext(); }
++template <class Ref> std::vector<Ref> box(std::vector<void*> const& values) {
++  std::vector<Ref> result;
++  result.reserve(values.size());
++  for (auto value : values) result.emplace_back(value);
++  return result;
++}
++template <class Ref> std::vector<void*> unbox(std::vector<Ref> const& values) {
++  std::vector<void*> result;
++  result.reserve(values.size());
++  for (auto value : values) result.emplace_back(value.data);
++  return result;
++}
++static void ForceCodeGen(Decl* D, compat::Interpreter& I);
++std::string MangleRTTI(TCppType_t type);
++static void InstantiateFunctionDefinition(Decl* D);
++bool IsClassTemplate(TCppScope_t scope);
++bool IsInlineFriendFunction(TCppScope_t scope);
++static SourceLocation GetValidSLoc(Sema& semaRef);
++bool IsIntegral(TCppType_t type);
++bool IsVoid(TCppType_t type);
++TCppType_t GetVoidType();
++bool IsTemplateSpecializationOf(TCppScope_t spec, TCppScope_t templ);
++TCppType_t GetCommonType(TCppType_t lhs, TCppType_t rhs);
++bool IsImplicitlyConvertible(TCppType_t from_type, TCppType_t to_type);
++bool IsCStyleConvertible(TCppType_t from_type, TCppType_t to_type);
++bool IsConstructible(TCppType_t to_type, TCppType_t from_type);
++std::string GetCompleteName(TCppType_t klass);
++static std::string TruncateTypeString(std::string const &typeString);
++std::string GetTruncatedName(TCppType_t klass);
++std::string GetQualifiedCompleteNameWithTemplateArgs(TCppType_t klass);
++static Decl* GetScopeFromType(QualType QT);
++TCppScope_t GetScopeFromType(TCppType_t type);
++static clang::Decl* GetUnderlyingScope(clang::Decl* D);
++TCppScope_t GetUnderlyingScope(TCppScope_t scope);
++bool HasUsableCopyConstructor(TCppScope_t scope);
++bool HasUsableMoveConstructor(TCppScope_t scope);
++bool HasDeletedMoveConstructor(TCppScope_t scope);
++std::string GetFunctionSourceInfo(TCppFunction_t func);
++TCppType_t GetFunctionReturnTypeFromType(TCppType_t func);
++TCppIndex_t GetFunctionNumArgsFromType(TCppType_t func);
++TCppType_t GetFunctionArgTypeFromType(TCppType_t func, TCppIndex_t iarg);
++bool IsFunctionVariadic(TCppFunction_t func);
++bool IsFunctionVariadicTemplate(TCppFunction_t fn);
++bool IsFunctionTypeConst(TCppType_t function_type);
++bool IsBodylessFunctionTemplateSpecialization(TCppFunction_t func);
++void AddOverloadCandidates(
++    Sema& S, const std::vector<TCppScope_t>& candidates,
++    const std::vector<TCppType_t>& arg_types,
++    const std::vector<TCppScope_t>& arg_scopes, OverloadCandidateSet& candSet,
++    SmallVectorImpl<Expr*>& non_member_args,
++    SmallVectorImpl<Expr*>& member_args, bool& has_member_candidate);
++OverloadCandidateConversion GetCandidateConversion(
++    const ImplicitConversionSequence& Conversion, const ASTContext& C);
++std::vector<TCppScope_t>
++BestOverloadMatch(const std::vector<TCppScope_t>& candidates,
++                  const std::vector<TCppType_t>& arg_types,
++                  const std::vector<TCppScope_t>& arg_scopes);
++OverloadCandidateInfo
++GetOverloadCandidateInfo(TCppScope_t candidate,
++                         const std::vector<TCppType_t>& arg_types,
++                         const std::vector<TCppScope_t>& arg_scopes);
++std::vector<TCppFunction_t> LookupMethods(const std::string& name,
++                                          TCppScope_t parent);
++intptr_t GetVariableOffset(compat::Interpreter& I, Decl* D,
++                           CXXRecordDecl* BaseCXXRD);
++intptr_t GetVariableOffset(TCppScope_t var, TCppScope_t parent);
++bool IsNonStaticVariable(TCppScope_t var);
++bool IsConstType(TCppType_t type);
++bool IsPointerToMemberType(TCppType_t type);
++bool IsPointerToMemberVariableType(TCppType_t type);
++bool IsPointerToMemberFunctionType(TCppType_t type);
++TCppType_t GetParentTypeFromPointerToMember(TCppType_t type);
++TCppType_t GetFunctionTypeFromPointerToMember(TCppType_t member_type,
++                                              TCppType_t obj_type);
++bool IsArrayType(TCppType_t type);
++bool IsSizedArrayType(TCppType_t type);
++size_t GetArraySize(TCppType_t type);
++TCppType_t GetArrayElementType(TCppType_t type);
++TCppType_t GetArrayType(TCppType_t type);
++TCppType_t GetArrayType(TCppType_t type, size_t size);
++TCppType_t GetFunctionType(TCppType_t ret,
++                           std::vector<TCppType_t> const& params);
++TCppType_t GetPointerToMemberType(TCppScope_t member);
++TCppType_t GetLValueReferenceType(TCppType_t type);
++TCppType_t GetRValueReferenceType(TCppType_t type);
++bool IsRvalueReferenceType(TCppType_t type);
++TCppType_t GetUnderlyingType(TCppType_t type);
++TCppType_t GetTypeWithoutCv(TCppType_t type);
++TCppType_t GetTypeWithConst(TCppType_t type);
++TCppType_t GetTypeWithVolatile(TCppType_t type);
++TCppType_t GetSignedType(TCppType_t type);
++TCppType_t GetUnsignedType(TCppType_t type);
++TCppType_t GetShortType(TCppType_t type);
++TCppType_t GetLongType(TCppType_t type);
++bool IsShortType(TCppType_t type);
++std::string GetTypeAsTruncatedString(TCppType_t var);
++static QualType findBuiltinType(llvm::StringRef typeName, ASTContext& Context);
++TCppType_t GetType(const std::string& name);
++bool IsTriviallyDestructible(TCppType_t type);
++static Decl* InstantiateTemplate(TemplateDecl* TemplateD,
++                                  TemplateArgumentListInfo& TLI, Sema& S,
++                                  bool instantiate_body);
++Decl* InstantiateTemplate(TemplateDecl* TemplateD,
++                          ArrayRef<TemplateArgument> TemplateArgs, Sema& S,
++                          bool instantiate_body);
++TCppScope_t InstantiateTemplate(compat::Interpreter& I, TCppScope_t tmpl,
++                                const TemplateArgInfo* template_args,
++                                size_t template_args_size,
++                                bool instantiate_body);
++TCppScope_t InstantiateTemplate(TCppScope_t tmpl,
++                                const TemplateArgInfo* template_args,
++                                size_t template_args_size,
++                                bool instantiate_body);
++bool InstantiateTemplate(TCppScope_t spec);
++static bool CompleteTemplateArguments(Sema& S, TemplateDecl* TemplateD,
++                                      const TemplateArgInfo* template_args,
++                                      size_t template_args_size,
++                                      SmallVectorImpl<TemplateArgument>& args);
++bool InstantiateFunction(clang::FunctionDecl* FD);
++OperatorArity GetOperatorArity(TCppFunction_t op);
++void GetOperator(Operator op, std::vector<TCppType_t> const& arg_types,
++                 std::vector<TCppFunction_t>& operators, OperatorArity kind);
++TCppType_t GetBuiltinOperatorType(Operator op,
++                                  std::vector<TCppType_t> const& arg_types);
++class clangSilent {
++public:
++  clangSilent(clang::DiagnosticsEngine& diag) : fDiagEngine(diag) {
++    fOldDiagValue = fDiagEngine.getSuppressAllDiagnostics();
++    fDiagEngine.setSuppressAllDiagnostics(true);
++  }
++
++  ~clangSilent() { fDiagEngine.setSuppressAllDiagnostics(fOldDiagValue); }
++
++protected:
++  clang::DiagnosticsEngine& fDiagEngine;
++  bool fOldDiagValue;
++};
++class DiagnosticTextConsumer final : public DiagnosticConsumer {
++public:
++  void HandleDiagnostic(DiagnosticsEngine::Level Level,
++                        const Diagnostic& Info) override {
++    if (Level != DiagnosticsEngine::Note)
++      return;
++    SmallString<256> Message;
++    Info.FormatDiagnostic(Message);
++    if (Message.empty())
++      return;
++    if (!Text.empty())
++      Text += " ";
++    Text.append(Message.begin(), Message.end());
++  }
++
++  std::string Text;
++};
++class DiagnosticClientRAII {
++private:
++  DiagnosticsEngine& Diags;
++  DiagnosticConsumer* OldClient;
++  std::unique_ptr<DiagnosticConsumer> OldOwner;
++  bool OldSuppressAllDiagnostics;
++  bool OldLastDiagnosticIgnored;
++
++public:
++  explicit DiagnosticClientRAII(DiagnosticsEngine& Diags)
++      : Diags(Diags), OldClient(Diags.getClient()),
++        OldOwner(Diags.takeClient()),
++        OldSuppressAllDiagnostics(Diags.getSuppressAllDiagnostics()),
++        OldLastDiagnosticIgnored(Diags.isLastDiagnosticIgnored()) {
++    Diags.setClient(&Consumer, false);
++    Diags.setSuppressAllDiagnostics(false);
++    Diags.setLastDiagnosticIgnored(false);
++  }
++
++  ~DiagnosticClientRAII() {
++    if (OldOwner) {
++      auto* Client = OldOwner.release();
++      Diags.setClient(Client, true);
++    } else {
++      Diags.setClient(OldClient, false);
++    }
++    Diags.setSuppressAllDiagnostics(OldSuppressAllDiagnostics);
++    Diags.setLastDiagnosticIgnored(OldLastDiagnosticIgnored);
++  }
++
++  DiagnosticTextConsumer Consumer;
++};
++static void ForceCodeGen(Decl* D, compat::Interpreter& I) {
++  // The decl was deferred by CodeGen. Force its emission.
++  // FIXME: In ASTContext::DeclMustBeEmitted we should check if the
++  // Decl::isUsed is set or we should be able to access CodeGen's
++  // addCompilerUsedGlobal.
++  ASTContext& C = I.getSema().getASTContext();
++
++  D->addAttr(UsedAttr::CreateImplicit(C));
++#ifdef CPPINTEROP_USE_CLING
++  cling::Interpreter::PushTransactionRAII RAII(&I);
++  I.getCI()->getASTConsumer().HandleTopLevelDecl(DeclGroupRef(D));
++#else // CLANG_REPL
++  I.getCI()->getASTConsumer().HandleTopLevelDecl(DeclGroupRef(D));
++  // Take the newest llvm::Module produced by CodeGen and send it to JIT.
++  auto GeneratedPTU = I.Parse("");
++  if (!GeneratedPTU)
++    llvm::logAllUnhandledErrors(GeneratedPTU.takeError(), llvm::errs(),
++                                "[ForceCodeGen] Failed to generate PTU:");
++
++  // From cling's BackendPasses.cpp
++  // FIXME: We need to upstream this code in IncrementalExecutor::addModule
++  for (auto& GV : GeneratedPTU->TheModule->globals()) {
++    llvm::GlobalValue::LinkageTypes LT = GV.getLinkage();
++    if (GV.isDeclaration() || !GV.hasName() ||
++        GV.getName().starts_with(".str") ||
++        !llvm::GlobalVariable::isDiscardableIfUnused(LT) ||
++        LT != llvm::GlobalValue::InternalLinkage)
++      continue; // nothing to do
++    GV.setLinkage(llvm::GlobalValue::WeakAnyLinkage);
++  }
++  if (auto Err = I.Execute(*GeneratedPTU))
++    llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(),
++                                "[ForceCodeGen] Failed to execute PTU:");
++#endif
++}
++
++std::string MangleRTTI(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  std::unique_ptr<clang::MangleContext> mc(
++      getASTContext().createMangleContext());
++
++  llvm::SmallString<128> buffer;
++  llvm::raw_svector_ostream out(buffer);
++
++  mc->mangleCXXRTTI(QT, out);
++
++  return out.str().str();
++}
++
++static void InstantiateFunctionDefinition(Decl* D) {
++  compat::SynthesizingCodeRAII RAII(&getInterp());
++  if (auto* FD = llvm::dyn_cast_or_null<FunctionDecl>(D)) {
++    getSema().InstantiateFunctionDefinition(SourceLocation(), FD,
++                                            /*Recursive=*/true,
++                                            /*DefinitionRequired=*/true);
++    // FIXME: this can go into a RAII object
++    clang::DiagnosticsEngine& Diags = getSema().getDiagnostics();
++    if (!FD->isDefined() && Diags.hasErrorOccurred()) {
++      // instantiation failed, need to reset DiagnosticsEngine
++      Diags.Reset(/*soft=*/true);
++      Diags.getClient()->clear();
++    }
++  }
++}
++
++bool IsClassTemplate(TCppScope_t scope) {
++  Decl* D = static_cast<Decl*>(scope);
++  return isa<ClassTemplateDecl>(D);
++}
++
++bool IsInlineFriendFunction(TCppScope_t scope) {
++  Decl* D = static_cast<Decl*>(scope);
++  auto& S = getSema();
++  ASTContext& Ctx = S.getASTContext();
++
++  // Unwrap function templates (e.g. `template<typename T> friend void f(T&) { ... }`)
++  if (auto* FTD = llvm::dyn_cast<FunctionTemplateDecl>(D))
++    D = FTD->getTemplatedDecl();
++
++  auto* FD = llvm::dyn_cast<FunctionDecl>(D);
++  if (!FD)
++    return false;
++
++  // Must actually be a friend declaration.
++  if (FD->getFriendObjectKind() == Decl::FOK_None)
++    return false;
++
++  // Must be the defining declaration (has a body), not just a friend
++  // declaration with the definition supplied elsewhere.
++  const FunctionDecl* Definition = nullptr;
++  if (!FD->isThisDeclarationADefinition()) {
++    if (!FD->hasBody(Definition))
++      return false;
++  } else {
++    Definition = FD;
++  }
++
++  // The defining declaration must be lexically nested inside the class
++  // (as opposed to a friend declared in the class and defined later at
++  // namespace scope), which is what makes it invisible to ordinary
++  // unqualified lookup and reachable only via ADL.
++  return Definition->getLexicalDeclContext()->isRecord();
++}
++
++static SourceLocation GetValidSLoc(Sema& semaRef) {
++  auto& SM = semaRef.getSourceManager();
++  return SM.getLocForStartOfFile(SM.getMainFileID());
++}
++
++bool IsIntegral(TCppType_t type) {
++  QualType Ty = QualType::getFromOpaquePtr(type);
++  return Ty->isIntegralType(getSema().getASTContext());
++}
++
++bool IsVoid(TCppType_t type) {
++  QualType Ty = QualType::getFromOpaquePtr(type);
++  return Ty->getUnqualifiedDesugaredType()->isVoidType();
++}
++
++TCppType_t GetVoidType() {
++  auto& S = getSema();
++  ASTContext& Ctx = S.getASTContext();
++  return Ctx.VoidTy.getAsOpaquePtr();
++}
++
++bool IsTemplateSpecializationOf(TCppScope_t spec, TCppScope_t templ) {
++  auto* S = (clang::Decl*)spec;
++  auto* T = (clang::Decl*)templ;
++
++  if (auto* ClassSpec = llvm::dyn_cast<ClassTemplateSpecializationDecl>(S)) {
++    if (auto* ClassTpl = llvm::dyn_cast<ClassTemplateDecl>(T)) {
++      return ClassSpec->getSpecializedTemplate()->getCanonicalDecl() ==
++             ClassTpl->getCanonicalDecl();
++    }
++  }
++
++  if (auto* FD = llvm::dyn_cast<FunctionDecl>(S)) {
++    if (auto* FTSI = FD->getTemplateSpecializationInfo()) {
++      if (auto* FnTpl = llvm::dyn_cast<FunctionTemplateDecl>(T)) {
++        return FTSI->getTemplate()->getCanonicalDecl() ==
++               FnTpl->getCanonicalDecl();
++      }
++    }
++  }
++
++  if (auto* VarSpec = llvm::dyn_cast<VarTemplateSpecializationDecl>(S)) {
++    if (auto* VarTpl = llvm::dyn_cast<VarTemplateDecl>(T)) {
++      return VarSpec->getSpecializedTemplate()->getCanonicalDecl() ==
++             VarTpl->getCanonicalDecl();
++    }
++  }
++
++  return false;
++}
++
++TCppType_t GetCommonType(TCppType_t lhs, TCppType_t rhs) {
++  QualType LHS = QualType::getFromOpaquePtr(lhs);
++  QualType RHS = QualType::getFromOpaquePtr(rhs);
++  Sema& S = getSema();
++  ASTContext& C = S.getASTContext();
++
++  // Suppress diagnostics: this is an introspection query, not real code,
++  // and LHS/RHS may legitimately have no common type at all.
++  Sema::SFINAETrap Trap(S);
++
++  if (LHS->isArithmeticType() && RHS->isArithmeticType()) {
++    ImplicitValueInitExpr* L = new (C) ImplicitValueInitExpr{LHS};
++    ImplicitValueInitExpr* R = new (C) ImplicitValueInitExpr{RHS};
++    ExprResult LRes(L), RRes(R);
++    QualType Common = S.UsualArithmeticConversions(LRes, RRes, SourceLocation(),
++                                                   ArithConvKind::Arithmetic);
++    if (Trap.hasErrorOccurred() || Common.isNull())
++      return nullptr;
++    return Common.getAsOpaquePtr();
++  }
++
++  // Pointers, arrays (which decay to pointers), member pointers, and
++  // std::nullptr_t all funnel through the composite pointer type rules
++  // that the conditional operator itself uses.
++  if ((LHS->isPointerType() || LHS->isArrayType() || LHS->isMemberPointerType() ||
++       LHS->isNullPtrType()) &&
++      (RHS->isPointerType() || RHS->isArrayType() || RHS->isMemberPointerType() ||
++       RHS->isNullPtrType())) {
++
++    Expr* L = new (C) ImplicitValueInitExpr{LHS};
++    Expr* R = new (C) ImplicitValueInitExpr{RHS};
++
++    // Mirrors Sema::CheckConditionalOperands: array-to-pointer decay (and
++    // lvalue-to-rvalue/function-to-pointer) must happen before we ask for
++    // the composite pointer type, or "char const[5]" won't be seen as a
++    // pointer at all.
++    ExprResult LRes = S.DefaultFunctionArrayLvalueConversion(L);
++    ExprResult RRes = S.DefaultFunctionArrayLvalueConversion(R);
++    if (LRes.isInvalid() || RRes.isInvalid())
++      return nullptr;
++
++    L = LRes.get();
++    R = RRes.get();
++
++    // Note: FindCompositePointerType takes Expr*& and may rewrite L/R with
++    // inserted qualification-conversion casts; we don't need those nodes,
++    // only the resulting type.
++    QualType Composite = S.FindCompositePointerType(SourceLocation(), L, R);
++
++    if (Trap.hasErrorOccurred() || Composite.isNull())
++      return nullptr;
++
++    if(Composite->isArrayType())
++      return GetPointerType(GetArrayElementType(Composite.getAsOpaquePtr()));
++
++    return Composite.getAsOpaquePtr();
++  }
++
++  return nullptr;
++}
++
++bool IsImplicitlyConvertible(TCppType_t from_type, TCppType_t to_type) {
++  QualType FromTy = QualType::getFromOpaquePtr(from_type);
++  QualType ToTy = QualType::getFromOpaquePtr(to_type);
++  auto& Sema = getSema();
++  auto& C = Sema.getASTContext();
++  Expr* DummyExpr = new (C) clang::OpaqueValueExpr(
++      clang::SourceLocation(), FromTy.getNonReferenceType(),
++      clang::ExprValueKind::VK_PRValue);
++  ImplicitConversionSequence ICS = Sema.TryImplicitConversion(
++      DummyExpr, ToTy, false, clang::Sema::AllowedExplicit::All, true, false,
++      false);
++  return ICS.isStandard() || ICS.isUserDefined() || ICS.isEllipsis();
++}
++
++bool IsCStyleConvertible(TCppType_t from_type, TCppType_t to_type) {
++  QualType FromTy = QualType::getFromOpaquePtr(from_type).getNonReferenceType();
++  QualType ToTy = QualType::getFromOpaquePtr(to_type);
++  auto& Sema = getSema();
++  auto& C = Sema.getASTContext();
++
++  // Build a dummy expression of type FromTy.
++  // Use a null pointer literal or zero literal as appropriate, then
++  // force its type to FromTy with an implicit cast; this avoids
++  // needing a full expression tree for user code.
++  Expr* Dummy = nullptr;
++  if (FromTy->isPointerType() || FromTy->isMemberPointerType()) {
++    auto* Zero = IntegerLiteral::Create(
++        C, llvm::APInt(C.getIntWidth(C.IntTy), 0), C.IntTy, SourceLocation());
++    Dummy = ImplicitCastExpr::Create(C, FromTy, CK_NullToPointer, Zero, nullptr,
++                                     VK_PRValue, FPOptionsOverride());
++  } else if (FromTy->isIntegralOrEnumerationType()) {
++    auto* Zero = IntegerLiteral::Create(
++        C, llvm::APInt(C.getIntWidth(FromTy), 0), FromTy, SourceLocation());
++    Dummy = Zero;
++  } else if (FromTy->isFunctionPointerType()) {
++    auto* Zero = IntegerLiteral::Create(
++        C, llvm::APInt(C.getIntWidth(C.IntTy), 0), C.IntTy, SourceLocation());
++    Dummy = ImplicitCastExpr::Create(C, FromTy, CK_NullToPointer, Zero, nullptr,
++                                     VK_PRValue, FPOptionsOverride());
++  } else {
++    // For other kinds of types, conservatively say no for now.
++    return false;
++  }
++
++  Sema::SFINAETrap trap(Sema, true);
++  auto TSI = C.getTrivialTypeSourceInfo(ToTy);
++  ExprResult CastRes =
++      Sema.BuildCStyleCastExpr(SourceLocation(), TSI, SourceLocation(), Dummy);
++  return !CastRes.isInvalid();
++}
++
++bool IsConstructible(TCppType_t to_type, TCppType_t from_type) {
++  clangSilent diagSuppr(getSema().getDiagnostics());
++
++  QualType FromTy = QualType::getFromOpaquePtr(from_type);
++  QualType ToTy = QualType::getFromOpaquePtr(to_type);
++
++  auto& S = getSema();
++  ASTContext& Ctx = S.getASTContext();
++  TypeSourceInfo* ToInfo = Ctx.getTrivialTypeSourceInfo(ToTy, SourceLocation());
++  TypeSourceInfo* FromInfo =
++      Ctx.getTrivialTypeSourceInfo(FromTy, SourceLocation());
++
++  ExprResult ER = S.BuildTypeTrait(TT_IsConstructible, SourceLocation(),
++                                   {ToInfo, FromInfo}, SourceLocation());
++  if (ER.isInvalid())
++    return false;
++
++  auto* TT = cast<TypeTraitExpr>(ER.get());
++  /* Some overload checks happen while template parameter packs are still dependent.
++   * Clang asserts if we ask for a bool value before the type trait is fully
++   * instantiated, so treat that case as a failed constructibility check. */
++  if(TT->isValueDependent())
++  {
++    return false;
++  }
++  return TT->getBoolValue();
++}
++
++std::string GetCompleteName(TCppType_t klass) {
++  auto& C = getSema().getASTContext();
++  auto* D = (Decl*)klass;
++
++  PrintingPolicy Policy = C.getPrintingPolicy();
++  Policy.SuppressUnwrittenScope = true;
++  Policy.SuppressScope = true;
++#if CLANG_VERSION_MAJOR < 23
++  Policy.AnonymousTagLocations = false;
++#endif
++  Policy.SuppressTemplateArgsInCXXConstructors = false;
++  Policy.SuppressDefaultTemplateArgs = false;
++  Policy.AlwaysIncludeTypeForTemplateArgument = true;
++
++  if (auto* ND = llvm::dyn_cast_or_null<NamedDecl>(D)) {
++    if (auto* TD = llvm::dyn_cast<TagDecl>(ND)) {
++      std::string type_name;
++      QualType QT = C.getCanonicalTagType(TD);
++      QT.getAsStringInternal(type_name, Policy);
++      return type_name;
++    }
++    if (auto* FD = llvm::dyn_cast<FunctionDecl>(ND)) {
++      std::string func_name;
++      llvm::raw_string_ostream name_stream(func_name);
++      FD->getNameForDiagnostic(name_stream, Policy, false);
++      name_stream.flush();
++      return func_name;
++    }
++
++    return ND->getNameAsString();
++  }
++
++  if (llvm::isa_and_nonnull<TranslationUnitDecl>(D)) {
++    return "";
++  }
++
++  return "<unnamed>";
++}
++
++static std::string TruncateTypeString(std::string const &typeString) {
++  std::string truncatedTypeString;
++  truncatedTypeString.reserve(typeString.size());
++
++  unsigned templateDepth = 0;
++  for (char character : typeString) {
++    if (character == '<') {
++      if (templateDepth == 0)
++        truncatedTypeString += "<…";
++      ++templateDepth;
++    } else if (character == '>' && templateDepth > 0) {
++      --templateDepth;
++      if (templateDepth == 0)
++        truncatedTypeString += '>';
++    } else if (templateDepth == 0) {
++      truncatedTypeString += character;
++    }
++  }
++
++  return truncatedTypeString;
++}
++
++std::string GetTruncatedName(TCppType_t klass) {
++  return TruncateTypeString(GetCompleteName(klass));
++}
++
++std::string GetQualifiedCompleteNameWithTemplateArgs(TCppType_t klass) {
++  auto& C = getSema().getASTContext();
++  auto* D = (Decl*)klass;
++
++  if (auto* ND = llvm::dyn_cast_or_null<NamedDecl>(D)) {
++    if (auto* TD = llvm::dyn_cast<TagDecl>(ND)) {
++      std::string type_name;
++      QualType QT = C.getCanonicalTagType(TD);
++      PrintingPolicy PP = C.getPrintingPolicy();
++      PP.FullyQualifiedName = true;
++      PP.SuppressUnwrittenScope = true;
++      QT.getAsStringInternal(type_name, PP);
++
++      return type_name;
++    }
++
++    if (auto* FD = llvm::dyn_cast<FunctionDecl>(ND)) {
++      PrintingPolicy PP = C.getPrintingPolicy();
++      PP.FullyQualifiedName = true;
++      PP.SuppressUnwrittenScope = true;
++
++      std::string name;
++      llvm::raw_string_ostream OS(name);
++
++      FD->printQualifiedName(OS, PP);
++
++      if (auto* Args = FD->getTemplateSpecializationArgs()) {
++        OS << '<';
++        for (unsigned i = 0; i < Args->size(); ++i) {
++          if (i > 0)
++            OS << ", ";
++          Args->get(i).print(PP, OS, /*IncludeType=*/true);
++        }
++        OS << '>';
++      }
++
++      return OS.str();
++    }
++
++    return ND->getQualifiedNameAsString();
++  }
++
++  if (llvm::isa_and_nonnull<TranslationUnitDecl>(D)) {
++    return "";
++  }
++
++  return "<unnamed>";
++}
++
++static Decl* GetScopeFromType(QualType QT) {
++  if (auto* Type = QT.getCanonicalType().getTypePtrOrNull()) {
++    Type = Type->getPointeeOrArrayElementType();
++    Type = Type->getUnqualifiedDesugaredType();
++    if (auto* ET = llvm::dyn_cast<EnumType>(Type))
++      return ET->getOriginalDecl();
++    CXXRecordDecl* CXXRD = Type->getAsCXXRecordDecl();
++    if (CXXRD)
++      return CXXRD->getCanonicalDecl();
++  }
++  return 0;
++}
++
++TCppScope_t GetScopeFromType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  return (TCppScope_t)GetScopeFromType(QT);
++}
++
++static clang::Decl* GetUnderlyingScope(clang::Decl* D) {
++  if (auto* TND = dyn_cast_or_null<TypedefNameDecl>(D)) {
++    if (auto* Scope = GetScopeFromType(TND->getUnderlyingType()))
++      D = Scope;
++  } else if (auto* USS = dyn_cast_or_null<UsingShadowDecl>(D)) {
++    if (auto* Scope = USS->getTargetDecl())
++      D = Scope;
++  }
++
++  return D->getCanonicalDecl();
++}
++
++TCppScope_t GetUnderlyingScope(TCppScope_t scope) {
++  if (!scope)
++    return 0;
++  return GetUnderlyingScope((clang::Decl*)scope);
++}
++
++bool HasUsableCopyConstructor(TCppScope_t scope) {
++  auto* D = (clang::Decl*)scope;
++
++  if (auto* CXXRD = llvm::dyn_cast_or_null<CXXRecordDecl>(D)) {
++    getSema().ForceDeclarationOfImplicitMembers(CXXRD);
++    if(CXXRD->hasSimpleCopyConstructor())
++      return true;
++
++    if(CXXRD->hasUserDeclaredCopyConstructor()) {
++      return !getSema().LookupCopyingConstructor(CXXRD, 0)->isDeleted();
++    }
++  }
++
++  return false;
++}
++
++bool HasUsableMoveConstructor(TCppScope_t scope) {
++  auto* D = (clang::Decl*)scope;
++
++  if (auto* CXXRD = llvm::dyn_cast_or_null<CXXRecordDecl>(D)) {
++    getSema().ForceDeclarationOfImplicitMembers(CXXRD);
++    if(CXXRD->hasSimpleMoveConstructor())
++      return true;
++
++    if(CXXRD->hasUserDeclaredMoveConstructor()) {
++      return !getSema().LookupMovingConstructor(CXXRD, 0)->isDeleted();
++    }
++  }
++
++  return false;
++}
++
++bool HasDeletedMoveConstructor(TCppScope_t scope) {
++  auto* D = (clang::Decl*)scope;
++
++  if (auto* CXXRD = llvm::dyn_cast_or_null<CXXRecordDecl>(D))
++    if(CXXRD->hasUserDeclaredMoveConstructor()) {
++      return getSema().LookupMovingConstructor(CXXRD, 0)->isDeleted();
++    }
++
++  return false;
++}
++
++std::string GetFunctionSourceInfo(TCppFunction_t func) {
++  if (!func)
++    return "";
++
++  auto* D = (clang::Decl*)func;
++  clang::FunctionDecl* FD;
++
++  if (llvm::dyn_cast<FunctionDecl>(D))
++    FD = llvm::dyn_cast<FunctionDecl>(D);
++  else if (auto* FTD = llvm::dyn_cast<clang::FunctionTemplateDecl>(D))
++    FD = FTD->getTemplatedDecl();
++  else
++    return "";
++
++  if (!FD)
++    return "";
++
++  clang::ASTContext &Ctx = FD->getASTContext();
++  clang::SourceManager &SM = Ctx.getSourceManager();
++
++  // Prefer the location of the definition if one is available,
++  // otherwise fall back to the declaration's location.
++  clang::SourceLocation Loc = FD->getLocation();
++  if (const clang::FunctionDecl* Def = FD->getDefinition())
++    Loc = Def->getLocation();
++
++  if (Loc.isInvalid())
++    return "";
++
++  clang::PresumedLoc PLoc = SM.getPresumedLoc(Loc);
++  if (PLoc.isInvalid())
++    return "";
++
++  llvm::StringRef FileName = PLoc.getFilename();
++  unsigned Line = PLoc.getLine();
++
++  std::string Result;
++  llvm::raw_string_ostream OS(Result);
++  OS << FileName << ":" << Line;
++  OS.flush();
++
++  return Result;
++}
++
++TCppType_t GetFunctionReturnTypeFromType(TCppType_t func) {
++  QualType TY = QualType::getFromOpaquePtr(func);
++
++  const clang::FunctionType* FT = nullptr;
++
++  if (const auto* F = TY->getAs<clang::FunctionType>()) {
++    FT = F;
++  } else if (const auto* PT = TY->getAs<clang::PointerType>()) {
++    FT = PT->getPointeeType()->getAs<clang::FunctionType>();
++  }
++
++  if (FT) {
++    return FT->getReturnType().getAsOpaquePtr();
++  }
++
++  return nullptr;
++}
++
++TCppIndex_t GetFunctionNumArgsFromType(TCppType_t func) {
++  QualType TY = QualType::getFromOpaquePtr(func);
++
++  const clang::FunctionType* FT = nullptr;
++
++  if (const auto* F = TY->getAs<clang::FunctionType>()) {
++    FT = F;
++  } else if (const auto* PT = TY->getAs<clang::PointerType>()) {
++    if (const auto* F = PT->getPointeeType()->getAs<clang::FunctionType>()) {
++      FT = F;
++    }
++  }
++
++  if (const auto* FPT = llvm::dyn_cast_or_null<clang::FunctionProtoType>(FT)) {
++    return FPT->getNumParams();
++  }
++
++  return 0;
++}
++
++TCppType_t GetFunctionArgTypeFromType(TCppType_t func, TCppIndex_t iarg) {
++  QualType TY = QualType::getFromOpaquePtr(func);
++
++  const clang::FunctionType* FT = nullptr;
++
++  if (const auto* F = TY->getAs<clang::FunctionType>()) {
++    FT = F;
++  } else if (const auto* PT = TY->getAs<clang::PointerType>()) {
++    FT = PT->getPointeeType()->getAs<clang::FunctionType>();
++  }
++
++  if (const auto* FPT = llvm::dyn_cast_or_null<clang::FunctionProtoType>(FT)) {
++    if (iarg < FPT->getNumParams()) {
++      return FPT->getParamType(iarg).getAsOpaquePtr();
++    }
++  }
++
++  return nullptr;
++}
++
++bool IsFunctionVariadic(TCppFunction_t func) {
++  if (!func)
++    return false;
++
++  auto* D = (clang::Decl*)func;
++  clang::FunctionDecl* FD;
++
++  if (llvm::dyn_cast<FunctionDecl>(D))
++    FD = llvm::dyn_cast<FunctionDecl>(D);
++  else if (auto* FTD = llvm::dyn_cast<clang::FunctionTemplateDecl>(D))
++    FD = FTD->getTemplatedDecl();
++  else
++    return false;
++
++  if (!FD)
++    return false;
++
++  return FD->isVariadic();
++}
++
++bool IsFunctionVariadicTemplate(TCppFunction_t fn) {
++  if(!fn)
++    return false;
++
++  auto * const decl{ static_cast<clang::Decl *>(fn) };
++  auto *function_decl{ llvm::dyn_cast_or_null<clang::FunctionDecl>(decl) };
++  if(!function_decl) {
++    if(auto * const template_decl{ llvm::dyn_cast_or_null<clang::FunctionTemplateDecl>(decl) })
++      function_decl = template_decl->getTemplatedDecl();
++  }
++  if(!function_decl || function_decl->getNumParams() == 0)
++    return false;
++
++  auto last_param{ function_decl->getParamDecl(function_decl->getNumParams() - 1) };
++  return last_param && last_param->isParameterPack();
++}
++
++bool IsFunctionTypeConst(TCppType_t function_type) {
++  QualType FT = QualType::getFromOpaquePtr(function_type);
++
++  if (const auto* MPT = FT->getAs<MemberPointerType>())
++    FT = MPT->getPointeeType();
++
++  if (const auto* FPT = FT->getAs<FunctionProtoType>())
++    return FPT->getMethodQuals().hasConst();
++
++  return false;
++}
++
++bool IsBodylessFunctionTemplateSpecialization(TCppFunction_t func) {
++  auto* D = static_cast<Decl*>(func);
++  if (auto* FTD = llvm::dyn_cast_or_null<FunctionTemplateDecl>(D))
++    return !FTD->getTemplatedDecl()->isDefined();
++
++  auto* FD = llvm::dyn_cast_or_null<FunctionDecl>(D);
++  if (!FD || FD->isDefined() || !FD->isTemplateInstantiation())
++    return false;
++
++  const FunctionDecl* Pattern =
++      FD->getTemplateInstantiationPattern(/*ForDefinition=*/true);
++  return !Pattern || !Pattern->isDefined();
++}
++
++void AddOverloadCandidates(
++    Sema& S, const std::vector<TCppScope_t>& candidates,
++    const std::vector<TCppType_t>& arg_types,
++    const std::vector<TCppScope_t>& arg_scopes, OverloadCandidateSet& candSet,
++    SmallVectorImpl<Expr*>& non_member_args,
++    SmallVectorImpl<Expr*>& member_args, bool& has_member_candidate) {
++  ASTContext& C = S.getASTContext();
++  SourceLocation Loc;
++
++  for (unsigned i = 0; i < arg_types.size(); ++i) {
++    QualType ArgTy = QualType::getFromOpaquePtr(arg_types[i]);
++    Decl* ArgDecl =
++        i < arg_scopes.size() ? static_cast<Decl*>(arg_scopes[i]) : nullptr;
++
++    if (auto* FTD = dyn_cast_or_null<FunctionTemplateDecl>(ArgDecl)) {
++      UnresolvedSet<8> Unres;
++      Unres.addDecl(FTD);
++      DeclarationNameInfo NameInfo(FTD->getDeclName(), Loc);
++      Expr* ULE = UnresolvedLookupExpr::Create(
++          C, /*NamingClass=*/nullptr, NestedNameSpecifierLoc(), NameInfo,
++          /*RequiresADL=*/false, Unres.begin(), Unres.end(),
++          /*KnownDependent=*/false, /*KnownInstantiationDependent=*/false);
++      non_member_args.push_back(ULE);
++      if (i)
++        member_args.push_back(ULE);
++    } else {
++      ExprValueKind ExprKind = ExprValueKind::VK_PRValue;
++      if (ArgTy->isLValueReferenceType())
++        ExprKind = ExprValueKind::VK_LValue;
++      else if (ArgTy->isRValueReferenceType())
++        ExprKind = ExprValueKind::VK_XValue;
++
++      auto* Expr =
++          new (C) OpaqueValueExpr(SourceLocation::getFromRawEncoding(1),
++                                  ArgTy.getNonReferenceType(), ExprKind);
++
++      non_member_args.push_back(Expr);
++      if (i)
++        member_args.push_back(non_member_args.back());
++    }
++  }
++
++  auto register_member = [&](CXXMethodDecl* MD,
++                             FunctionTemplateDecl* FTD) -> bool {
++    if (MD->isDeleted())
++      return false;
++    if (!MD->isStatic()) {
++      DeclAccessPair found = DeclAccessPair::make(MD, MD->getAccess());
++      TemplateArgumentListInfo ExplicitTemplateArgs{};
++
++      if (auto* CD = dyn_cast<CXXConstructorDecl>(MD)) {
++        if (FTD)
++          S.AddTemplateOverloadCandidate(FTD, found, &ExplicitTemplateArgs,
++                                         non_member_args, candSet);
++        else
++          S.AddOverloadCandidate(CD, found, non_member_args, candSet);
++        return false;
++      }
++
++      if (arg_types.empty())
++        return true;
++
++      QualType OT = QualType::getFromOpaquePtr(arg_types[0]);
++      ExprValueKind ExprKind = ExprValueKind::VK_PRValue;
++      if (OT->isLValueReferenceType())
++        ExprKind = ExprValueKind::VK_LValue;
++      else if (OT->isRValueReferenceType())
++        ExprKind = ExprValueKind::VK_XValue;
++
++      OpaqueValueExpr Expr(SourceLocation::getFromRawEncoding(1),
++                           OT.getNonReferenceType(), ExprKind);
++      Expr::Classification objClass = Expr.Classify(C);
++
++      has_member_candidate = true;
++      if (FTD) {
++        S.AddMethodTemplateCandidate(
++            FTD, found, MD->getParent(), &ExplicitTemplateArgs,
++            OT.getNonReferenceType(), objClass, member_args, candSet);
++        return false;
++      } else {
++        S.AddMethodCandidate(found, OT.getNonReferenceType(), objClass,
++                             member_args, candSet);
++        return false;
++      }
++    }
++    return true;
++  };
++
++  for (TCppScope_t F : candidates) {
++    Decl* D = static_cast<Decl*>(F);
++
++    // Unwrap ConstructorUsingShadowDecl (from `using Base::Base;`)
++    // to get the inherited constructor and add it in the derived class context.
++    if (auto* Shadow = dyn_cast<ConstructorUsingShadowDecl>(D)) {
++      CXXConstructorDecl* CD =
++          dyn_cast<CXXConstructorDecl>(Shadow->getTargetDecl());
++      if (!CD)
++        continue;
++      // Use the shadow's access (which reflects the using-decl's access),
++      // not the base constructor's access.
++      DeclAccessPair found = DeclAccessPair::make(CD, Shadow->getAccess());
++      // Pass the derived class as the object type so Sema checks the right
++      // conversion sequences.
++      S.AddOverloadCandidate(CD, found, non_member_args, candSet);
++      continue;
++    }
++
++    if (auto* MD = dyn_cast<CXXMethodDecl>(D)) {
++      if (!register_member(MD, dyn_cast<FunctionTemplateDecl>(MD)))
++        continue;
++    }
++
++    if (auto* FTD = dyn_cast<FunctionTemplateDecl>(D)) {
++      if (auto* MD = dyn_cast<CXXMethodDecl>(FTD->getTemplatedDecl())) {
++        if (!register_member(MD, FTD))
++          continue;
++      }
++      TemplateArgumentListInfo ExplicitTemplateArgs{};
++      S.AddTemplateOverloadCandidate(
++          FTD, DeclAccessPair::make(FTD, FTD->getAccess()),
++          &ExplicitTemplateArgs, non_member_args, candSet);
++      continue;
++    }
++    if (auto* FD = dyn_cast<FunctionDecl>(D)) {
++      S.AddOverloadCandidate(FD, DeclAccessPair::make(FD, FD->getAccess()),
++                             non_member_args, candSet);
++      continue;
++    }
++  }
++}
++
++OverloadCandidateConversion GetCandidateConversion(
++    const ImplicitConversionSequence& Conversion, const ASTContext& C) {
++  if (!Conversion.isInitialized() || Conversion.isBad() ||
++      Conversion.isAmbiguous())
++    return OverloadCandidateConversion::Invalid;
++  if (Conversion.isUserDefined())
++    return OverloadCandidateConversion::UserDefined;
++  if (Conversion.isStandard())
++    return Conversion.Standard.isPerfect(C)
++               ? OverloadCandidateConversion::None
++               : OverloadCandidateConversion::Implicit;
++  return OverloadCandidateConversion::Implicit;
++}
++
++std::vector<TCppScope_t>
++BestOverloadMatch(const std::vector<TCppScope_t>& candidates,
++                  const std::vector<TCppType_t>& arg_types,
++                  const std::vector<TCppScope_t>& arg_scopes) {
++  Sema& S = getSema();
++  SourceLocation Loc;
++
++  OverloadCandidateSet candSet(
++      Loc, OverloadCandidateSet::CandidateSetKind::CSK_Normal);
++
++  SmallVector<Expr*, 8> non_member_args;
++  SmallVector<Expr*, 8> member_args;
++  bool has_member_candidate{};
++  AddOverloadCandidates(S, candidates, arg_types, arg_scopes, candSet,
++                        non_member_args, member_args, has_member_candidate);
++
++  OverloadCandidateSet::iterator best;
++  candSet.BestViableFunction(S, Loc, best);
++  if (best != candSet.end() && best->Viable)
++    return {best->Function};
++
++  auto ambiguous = candSet.CompleteCandidates(
++      S, OverloadCandidateDisplayKind::OCD_AmbiguousCandidates,
++      non_member_args);
++  if (ambiguous.empty() && has_member_candidate)
++    ambiguous = candSet.CompleteCandidates(
++        S, OverloadCandidateDisplayKind::OCD_AmbiguousCandidates, member_args);
++
++  std::vector<TCppScope_t> ret;
++  ret.reserve(ambiguous.size());
++  for(auto const C : ambiguous)
++  {
++    ret.emplace_back(C->Function);
++  }
++  return ret;
++}
++
++OverloadCandidateInfo
++GetOverloadCandidateInfo(TCppScope_t candidate,
++                         const std::vector<TCppType_t>& arg_types,
++                         const std::vector<TCppScope_t>& arg_scopes) {
++  OverloadCandidateInfo ret;
++  if (!candidate)
++    return ret;
++
++  Sema& S = getSema();
++  ASTContext& C = S.getASTContext();
++  SourceLocation Loc;
++  OverloadCandidateSet candSet(
++      Loc, OverloadCandidateSet::CandidateSetKind::CSK_Normal);
++  SmallVector<Expr*, 8> non_member_args;
++  SmallVector<Expr*, 8> member_args;
++  bool has_member_candidate{};
++  AddOverloadCandidates(S, {candidate}, arg_types, arg_scopes, candSet,
++                        non_member_args, member_args, has_member_candidate);
++  if (candSet.empty())
++    return ret;
++
++  OverloadCandidateSet::iterator Candidate = candSet.begin();
++  ret.m_Viable = Candidate->Viable;
++  auto* D = static_cast<Decl*>(candidate);
++  auto const is_function_template = isa<FunctionTemplateDecl>(D);
++  ret.m_IsTemplateInstantiationFailure =
++      !ret.m_Viable && is_function_template &&
++      (Candidate->FailureKind == ovl_fail_bad_deduction ||
++       Candidate->FailureKind == ovl_fail_constraints_not_satisfied);
++
++  SmallVector<OverloadCandidate*, 1> candidates{&*Candidate};
++  auto const& diagnostic_args =
++      has_member_candidate ? member_args : non_member_args;
++  {
++    DiagnosticClientRAII diagnostic_client{S.getDiagnostics()};
++    candSet.NoteCandidates(S, diagnostic_args, candidates);
++    ret.m_Reason = diagnostic_client.Consumer.Text;
++  }
++
++  if (auto* FTD = dyn_cast<FunctionTemplateDecl>(D))
++    D = FTD->getTemplatedDecl();
++  auto* FD = dyn_cast_or_null<FunctionDecl>(D);
++  auto const member_offset = has_member_candidate ? 1u : 0u;
++  auto const arg_count = arg_types.size() > member_offset
++                              ? arg_types.size() - member_offset
++                              : 0u;
++  auto const param_count = FD ? FD->getNumParams() : 0u;
++  auto const result_count = std::min(arg_count, static_cast<size_t>(param_count));
++  for (size_t i{}; i < result_count; ++i) {
++    auto const conversion_index = i + member_offset;
++    auto const conversion =
++        conversion_index < Candidate->Conversions.size()
++            ? GetCandidateConversion(Candidate->Conversions[conversion_index],
++                                      C)
++            : OverloadCandidateConversion::Invalid;
++    ret.m_Arguments.emplace_back(
++        OverloadCandidateArgument{GetFunctionArgType(candidate, i), conversion});
++  }
++
++  return ret;
++}
++
++std::vector<TCppFunction_t> LookupMethods(const std::string& name,
++                                          TCppScope_t parent) {
++  using namespace clang;
++
++  std::vector<TCppFunction_t> results;
++  Decl* D = static_cast<Decl*>(parent);
++  if (!D)
++    return results;
++
++  auto& Ctx = getASTContext();
++  Sema& S = getSema(); // however you access your Sema
++
++  // Resolve to a CXXRecordDecl *definition* to do member lookup on.
++  auto resolveRecordDef = [&](Decl* Any) -> CXXRecordDecl* {
++    // If we were handed a record directly.
++    if (auto* RD = dyn_cast<CXXRecordDecl>(Any)) {
++      if (auto* Def = RD->getDefinition())
++        return Def;
++      return RD;
++    }
++
++    // If we were handed a class template specialization.
++    if (auto* Spec = dyn_cast<ClassTemplateSpecializationDecl>(Any)) {
++      if (auto* CTD = Spec->getSpecializedTemplate()) {
++        if (auto* Templated = CTD->getTemplatedDecl()) {
++          if (auto* Def = Templated->getDefinition())
++            return Def;
++          return Templated;
++        }
++      }
++      // Fall back to the specialization’s own definition if any.
++      if (auto* Def = Spec->getDefinition())
++        return Def;
++      return Spec;
++    }
++
++    // If we were handed a typedef / type alias to a class template or record.
++    if (auto* TDN = dyn_cast<TypedefNameDecl>(Any)) {
++      if (auto* RD = TDN->getUnderlyingType()->getAsCXXRecordDecl()) {
++        if (auto* Def = RD->getDefinition())
++          return Def;
++        return RD;
++      }
++    }
++
++    // If we were handed *something* that is a DeclContext, try its type.
++    if (auto* DC = dyn_cast<DeclContext>(Any)) {
++      if (auto* RD = dyn_cast<CXXRecordDecl>(DC)) {
++        if (auto* Def = RD->getDefinition())
++          return Def;
++        return RD;
++      }
++    }
++
++    return nullptr;
++  };
++
++  CXXRecordDecl* RD = resolveRecordDef(D);
++  if (!RD)
++    return results;
++
++  // Ensure the class type is complete enough for lookup to visit bases, etc.
++  // (Location can be empty; we just want to trigger completion if needed.)
++  (void)S.RequireCompleteType(SourceLocation(), Ctx.getCanonicalTagType(RD),
++                              diag::err_typecheck_incomplete_tag);
++
++  // Build the lookup name.
++  IdentifierInfo& II = Ctx.Idents.get(name);
++  LookupResult R(S, &II, SourceLocation(), Sema::LookupMemberName);
++  R.suppressAccessDiagnostics();
++
++  // Perform qualified member lookup (this walks bases, applies using-decls).
++  // Important: do NOT call DeclContext::lookup here; that’s a flat map of
++  // *direct* members only.
++  bool FoundAny = S.LookupQualifiedName(R, RD);
++
++  if (!FoundAny) {
++    // As a fallback, try on the primary template’s pattern if RD is a spec.
++    if (auto* Spec = dyn_cast<ClassTemplateSpecializationDecl>(RD)) {
++      if (auto* CTD = Spec->getSpecializedTemplate()) {
++        if (auto* Templated = CTD->getTemplatedDecl()) {
++          (void)S.RequireCompleteType(SourceLocation(),
++                                      Ctx.getCanonicalTagType(Templated),
++                                      diag::err_typecheck_incomplete_tag);
++          LookupResult R2(S, &II, SourceLocation(), Sema::LookupMemberName);
++          S.LookupQualifiedName(R2, Templated);
++          for (NamedDecl* ND : R2) {
++            if (auto* USD = dyn_cast<UsingShadowDecl>(ND))
++              ND = USD->getTargetDecl();
++            if (auto* MD = dyn_cast<CXXMethodDecl>(ND))
++              results.push_back(MD);
++            else if (auto* FTD = dyn_cast<FunctionTemplateDecl>(ND))
++              results.push_back(FTD);
++          }
++          return results;
++        }
++      }
++    }
++    return results;
++  }
++
++  // Collect results, unwrapping using-shadow decls.
++  for (NamedDecl* ND : R) {
++    if (auto* USD = dyn_cast<UsingShadowDecl>(ND))
++      ND = USD->getTargetDecl();
++    if (auto* MD = dyn_cast<CXXMethodDecl>(ND)) {
++      results.push_back(MD);
++    } else if (auto* FTD = dyn_cast<FunctionTemplateDecl>(ND)) {
++      results.push_back(FTD);
++    }
++  }
++
++  return results;
++}
++
++intptr_t GetVariableOffset(compat::Interpreter& I, Decl* D,
++                           CXXRecordDecl* BaseCXXRD) {
++  if (!D)
++    return 0;
++
++  auto& C = I.getSema().getASTContext();
++
++  if (auto* FD = llvm::dyn_cast<FieldDecl>(D)) {
++    clang::RecordDecl* FieldParentRecordDecl = FD->getParent();
++    intptr_t offset = C.toCharUnitsFromBits(C.getFieldOffset(FD)).getQuantity();
++    while (FieldParentRecordDecl->isAnonymousStructOrUnion()) {
++      clang::RecordDecl* anon = FieldParentRecordDecl;
++      FieldParentRecordDecl = llvm::dyn_cast<RecordDecl>(anon->getParent());
++      for (auto F = FieldParentRecordDecl->field_begin();
++           F != FieldParentRecordDecl->field_end(); ++F) {
++        const auto* RT = F->getType()->getAs<RecordType>();
++        if (!RT)
++          continue;
++        if (anon == RT->getOriginalDecl()) {
++          FD = *F;
++          break;
++        }
++      }
++      offset += C.toCharUnitsFromBits(C.getFieldOffset(FD)).getQuantity();
++    }
++    if (BaseCXXRD && BaseCXXRD != FieldParentRecordDecl->getCanonicalDecl()) {
++      // FieldDecl FD belongs to some class C, but the base class BaseCXXRD is
++      // not C. That means BaseCXXRD derives from C. Offset needs to be
++      // calculated for Derived class
++
++      // Depth first Search is performed to the class that declares FD from
++      // the base class
++      std::vector<CXXRecordDecl*> stack;
++      std::map<CXXRecordDecl*, CXXRecordDecl*> direction;
++      stack.push_back(BaseCXXRD);
++      while (!stack.empty()) {
++        CXXRecordDecl* RD = stack.back();
++        stack.pop_back();
++        size_t num_bases = GetNumBases(RD);
++        bool flag = false;
++        for (size_t i = 0; i < num_bases; i++) {
++          auto* CRD = static_cast<CXXRecordDecl*>(GetBaseClass(RD, i));
++          direction[CRD] = RD;
++          if (CRD == FieldParentRecordDecl) {
++            flag = true;
++            break;
++          }
++          stack.push_back(CRD);
++        }
++        if (flag)
++          break;
++      }
++      if (auto* RD = llvm::dyn_cast<CXXRecordDecl>(FieldParentRecordDecl)) {
++        // add in the offsets for the (multi level) base classes
++        RD = RD->getCanonicalDecl();
++        while (BaseCXXRD != RD) {
++          CXXRecordDecl* Parent = direction.at(RD);
++          offset +=
++              C.getASTRecordLayout(Parent).getBaseClassOffset(RD).getQuantity();
++          RD = Parent;
++        }
++      } else {
++        assert(false && "Unreachable");
++      }
++    }
++    return offset;
++  }
++
++  if (auto* VD = llvm::dyn_cast<VarDecl>(D)) {
++    auto GD = GlobalDecl(VD);
++    std::string mangledName;
++    compat::maybeMangleDeclName(GD, mangledName);
++    void* address = llvm::sys::DynamicLibrary::SearchForAddressOfSymbol(
++        mangledName.c_str());
++
++    if (!address)
++      address = I.getAddressOfGlobal(GD);
++    if (!address) {
++      if (!VD->hasInit()) {
++        compat::SynthesizingCodeRAII RAII(&getInterp());
++        getSema().InstantiateVariableDefinition(SourceLocation(), VD);
++        VD = VD->getDefinition();
++      }
++      if (VD->hasInit() &&
++          (VD->isConstexpr() || VD->getType().isConstQualified())) {
++        if (const APValue* val = VD->evaluateValue()) {
++          if (VD->getType()->isIntegralType(C)) {
++            return (intptr_t)val->getInt().getRawData();
++          }
++        }
++      }
++    }
++    if (!address) {
++      auto Linkage = C.GetGVALinkageForVariable(VD);
++      if (isDiscardableGVALinkage(Linkage))
++        ForceCodeGen(VD, I);
++    }
++    auto VDAorErr = compat::getSymbolAddress(I, StringRef(mangledName));
++    if (!VDAorErr) {
++      llvm::logAllUnhandledErrors(VDAorErr.takeError(), llvm::errs(),
++                                  "Failed to GetVariableOffset:");
++      return 0;
++    }
++    return (intptr_t)jitTargetAddressToPointer<void*>(VDAorErr.get());
++  }
++
++  return 0;
++}
++
++intptr_t GetVariableOffset(TCppScope_t var, TCppScope_t parent) {
++  auto* D = static_cast<Decl*>(var);
++  auto* RD = llvm::dyn_cast_or_null<CXXRecordDecl>(static_cast<Decl*>(parent));
++  return GetVariableOffset(getInterp(), D, RD);
++}
++
++bool IsNonStaticVariable(TCppScope_t var) {
++  auto* D = (Decl*)var;
++  if (llvm::isa_and_nonnull<FieldDecl>(D)) {
++    return true;
++  }
++
++  return false;
++}
++
++bool IsConstType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  return QT.isConstQualified();
++}
++
++bool IsPointerToMemberType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  return QT->isMemberPointerType();
++}
++
++bool IsPointerToMemberVariableType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  return QT->isMemberDataPointerType();
++}
++
++bool IsPointerToMemberFunctionType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  return QT->isMemberFunctionPointerType();
++}
++
++TCppType_t GetParentTypeFromPointerToMember(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  if (!QT->isMemberPointerType())
++    return nullptr;
++
++  const MemberPointerType* MPT = QT->getAs<MemberPointerType>();
++  const CXXRecordDecl* RD = MPT->getMostRecentCXXRecordDecl();
++
++  ASTContext& C = getASTContext();
++  return C.getCanonicalTagType(RD).getAsOpaquePtr();
++}
++
++TCppType_t GetFunctionTypeFromPointerToMember(TCppType_t member_type,
++                                              TCppType_t obj_type) {
++  ASTContext& C = getSema().getASTContext();
++  QualType MT = QualType::getFromOpaquePtr(member_type);
++  const MemberPointerType* MPT = MT->getAs<MemberPointerType>();
++  if (!MPT)
++    return nullptr;
++
++  QualType PointeeType = MPT->getPointeeType();
++  QualType OT = QualType::getFromOpaquePtr(obj_type).getNonReferenceType();
++  QualType ClassType = C.getCanonicalTagType(MPT->getMostRecentCXXRecordDecl());
++  if (OT.isConstQualified())
++    ClassType.addConst();
++  if (OT->isPointerType())
++    ClassType = C.getPointerType(ClassType);
++  else
++    ClassType = C.getLValueReferenceType(ClassType);
++
++  QualType FT;
++
++  if (const FunctionProtoType* FPT = PointeeType->getAs<FunctionProtoType>()) {
++    llvm::SmallVector<QualType, 8> ParamTypes;
++    ParamTypes.push_back(ClassType);
++    for (QualType P : FPT->param_types())
++      ParamTypes.push_back(P);
++
++    FunctionProtoType::ExtProtoInfo EPI = FPT->getExtProtoInfo();
++    EPI.RefQualifier = RQ_None;
++    EPI.TypeQuals = Qualifiers();
++
++    FT = C.getFunctionType(FPT->getReturnType(), ParamTypes, EPI);
++  } else {
++    FunctionProtoType::ExtProtoInfo EPI;
++    EPI.ExceptionSpec.Type = EST_None;
++
++    FT = C.getFunctionType(PointeeType, {ClassType}, EPI);
++  }
++
++  return FT.getAsOpaquePtr();
++}
++
++bool IsArrayType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  return QT->isArrayType();
++}
++
++bool IsSizedArrayType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  return QT->isConstantArrayType();
++}
++
++size_t GetArraySize(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  ASTContext& Ctx = getASTContext();
++  if (auto* CAT = Ctx.getAsConstantArrayType(QT)) {
++    return CAT->getLimitedSize();
++  }
++  return 0;
++}
++
++TCppType_t GetArrayElementType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  ASTContext& Ctx = getASTContext();
++
++  QualType ElemTy;
++  if (auto* CAT = Ctx.getAsConstantArrayType(QT)) {
++    // e.g. int[10]
++    ElemTy = CAT->getElementType();
++  } else if (auto* IAT = Ctx.getAsIncompleteArrayType(QT)) {
++    // e.g. extern int[]
++    ElemTy = IAT->getElementType();
++  } else if (auto* DSAT = Ctx.getAsDependentSizedArrayType(QT)) {
++    // e.g. T[N] where N is a dependent expression
++    ElemTy = DSAT->getElementType();
++  } else if (auto* VAT = Ctx.getAsVariableArrayType(QT)) {
++    // e.g. int arr[n]; where n is runtime
++    ElemTy = VAT->getElementType();
++  } else {
++    // Not an array type
++    return nullptr;
++  }
++
++  return ElemTy.getAsOpaquePtr();
++}
++
++TCppType_t GetArrayType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  ASTContext& Ctx = getASTContext();
++  auto& S = getSema();
++
++  QualType ArrayQT =
++      Ctx.getIncompleteArrayType(QT, clang::ArraySizeModifier::Normal, 0);
++  return ArrayQT.getAsOpaquePtr();
++}
++
++TCppType_t GetArrayType(TCppType_t type, size_t size) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  ASTContext& Ctx = getASTContext();
++  auto& S = getSema();
++
++  QualType ArrayQT = Ctx.getConstantArrayType(
++      QT, llvm::APInt(Ctx.getIntWidth(Ctx.getSizeType()), size), nullptr,
++      clang::ArraySizeModifier::Normal, 0);
++  return ArrayQT.getAsOpaquePtr();
++}
++
++TCppType_t GetFunctionType(TCppType_t ret,
++                           std::vector<TCppType_t> const& params) {
++  QualType R = QualType::getFromOpaquePtr(ret);
++  ASTContext& Ctx = getASTContext();
++  auto& S = getSema();
++
++  llvm::SmallVector<QualType, 8> ParamTypes;
++  ParamTypes.reserve(params.size());
++  for (TCppType_t P : params)
++    ParamTypes.push_back(QualType::getFromOpaquePtr(P));
++
++  FunctionProtoType::ExtProtoInfo EPI;
++  EPI.ExceptionSpec.Type = EST_None;
++
++  QualType FnType = Ctx.getFunctionType(R, ParamTypes, EPI);
++
++  return FnType.getAsOpaquePtr();
++}
++
++TCppType_t GetPointerToMemberType(TCppScope_t member) {
++  auto* M = (Decl*)member;
++  ASTContext& C = getSema().getASTContext();
++
++  QualType MemberType;
++  if (auto* VD = dyn_cast<ValueDecl>(M))
++    MemberType = VD->getType();
++  else
++    return nullptr;
++
++  auto* RD = dyn_cast<CXXRecordDecl>(M->getDeclContext());
++  if (!RD)
++    return nullptr;
++
++  QualType ClassType = C.getCanonicalTagType(RD);
++  NestedNameSpecifier Qualifier{ClassType.getTypePtr()};
++  QualType PtrToMember = C.getMemberPointerType(MemberType, Qualifier, RD);
++
++  return PtrToMember.getAsOpaquePtr();
++}
++
++TCppType_t GetLValueReferenceType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  QualType PointerTy = getASTContext().getLValueReferenceType(QT);
++  return PointerTy.getAsOpaquePtr();
++}
++
++TCppType_t GetRValueReferenceType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  QualType PointerTy = getASTContext().getRValueReferenceType(QT);
++  return PointerTy.getAsOpaquePtr();
++}
++
++bool IsRvalueReferenceType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  return QT->isRValueReferenceType();
++}
++
++TCppType_t GetUnderlyingType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  QT = QT->getCanonicalTypeUnqualified();
++
++  // Recursively remove array dimensions
++  while (QT->isArrayType())
++    QT = QualType(QT->getArrayElementTypeNoTypeQual(), 0);
++
++  // Recursively reduce pointer depth till we are left with a pointerless
++  // type.
++  for (auto PT = QT->getPointeeType(); !PT.isNull();
++       PT = QT->getPointeeType()) {
++    QT = PT;
++  }
++  QT = QT->getCanonicalTypeUnqualified();
++  return QT.getAsOpaquePtr();
++}
++
++TCppType_t GetTypeWithoutCv(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  QT = QualType(QT->getUnqualifiedDesugaredType(), 0);
++  return QT.getAsOpaquePtr();
++}
++
++TCppType_t GetTypeWithConst(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  QT.addConst();
++  return QT.getAsOpaquePtr();
++}
++
++TCppType_t GetTypeWithVolatile(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++  QT.addVolatile();
++  return QT.getAsOpaquePtr();
++}
++
++TCppType_t GetSignedType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++
++  // Get the canonical unqualified type to inspect the builtin kind
++  const BuiltinType* BT = QT->getAs<BuiltinType>();
++  if (!BT)
++    return QT.getAsOpaquePtr();
++
++  ASTContext& C = getSema().getASTContext();
++
++  QualType SignedQT;
++  switch (BT->getKind()) {
++  // Already signed — return as-is
++  case BuiltinType::SChar:
++  case BuiltinType::Short:
++  case BuiltinType::Int:
++  case BuiltinType::Long:
++  case BuiltinType::LongLong:
++  case BuiltinType::Int128:
++    return QT.getAsOpaquePtr();
++
++  // Unsigned -> signed counterpart
++  case BuiltinType::UChar:
++  case BuiltinType::Char_U:
++    SignedQT = C.SignedCharTy;
++    break;
++  case BuiltinType::UShort:
++    SignedQT = C.ShortTy;
++    break;
++  case BuiltinType::UInt:
++    SignedQT = C.IntTy;
++    break;
++  case BuiltinType::ULong:
++    SignedQT = C.LongTy;
++    break;
++  case BuiltinType::ULongLong:
++    SignedQT = C.LongLongTy;
++    break;
++  case BuiltinType::UInt128:
++    SignedQT = C.Int128Ty;
++    break;
++
++  // char (platform-dependent signedness) -> signed char
++  case BuiltinType::Char_S:
++    return QT.getAsOpaquePtr(); // already signed on this platform
++
++  // Wchar, char8, char16, char32 — no signed equivalent; return as-is
++  default:
++    return QT.getAsOpaquePtr();
++  }
++
++  // Preserve qualifiers (const, volatile, etc.) from the original type
++  SignedQT = C.getQualifiedType(SignedQT, QT.getQualifiers());
++
++  return SignedQT.getAsOpaquePtr();
++}
++
++TCppType_t GetUnsignedType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++
++  const BuiltinType* BT = QT->getAs<BuiltinType>();
++  if (!BT)
++    return QT.getAsOpaquePtr();
++
++  ASTContext& C = getSema().getASTContext();
++
++  QualType UnsignedQT;
++  switch (BT->getKind()) {
++  // Already unsigned — return as-is
++  case BuiltinType::UChar:
++  case BuiltinType::Char_U:
++  case BuiltinType::UShort:
++  case BuiltinType::UInt:
++  case BuiltinType::ULong:
++  case BuiltinType::ULongLong:
++  case BuiltinType::UInt128:
++    return QT.getAsOpaquePtr();
++
++  // Signed -> unsigned counterpart
++  case BuiltinType::SChar:
++  case BuiltinType::Char_S:
++    UnsignedQT = C.UnsignedCharTy;
++    break;
++  case BuiltinType::Short:
++    UnsignedQT = C.UnsignedShortTy;
++    break;
++  case BuiltinType::Int:
++    UnsignedQT = C.UnsignedIntTy;
++    break;
++  case BuiltinType::Long:
++    UnsignedQT = C.UnsignedLongTy;
++    break;
++  case BuiltinType::LongLong:
++    UnsignedQT = C.UnsignedLongLongTy;
++    break;
++  case BuiltinType::Int128:
++    UnsignedQT = C.UnsignedInt128Ty;
++    break;
++
++  // No unsigned equivalent — return as-is
++  default:
++    return QT.getAsOpaquePtr();
++  }
++
++  // Preserve qualifiers (const, volatile, etc.) from the original type
++  UnsignedQT = C.getQualifiedType(UnsignedQT, QT.getQualifiers());
++
++  return UnsignedQT.getAsOpaquePtr();
++}
++
++TCppType_t GetShortType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++
++  const BuiltinType* BT = QT->getAs<BuiltinType>();
++  if (!BT)
++    return QT.getAsOpaquePtr();
++
++  ASTContext& C = getSema().getASTContext();
++
++  QualType ShortQT;
++  switch (BT->getKind()) {
++    case BuiltinType::Short:
++    case BuiltinType::UShort:
++      return QT.getAsOpaquePtr();
++
++    case BuiltinType::Int:
++    case BuiltinType::Long:
++    case BuiltinType::LongLong:
++    case BuiltinType::Int128:
++    case BuiltinType::SChar:
++      ShortQT = C.ShortTy;
++      break;
++
++    case BuiltinType::UInt:
++    case BuiltinType::ULong:
++    case BuiltinType::ULongLong:
++    case BuiltinType::UInt128:
++    case BuiltinType::UChar:
++    case BuiltinType::Char_U:
++      ShortQT = C.UnsignedShortTy;
++      break;
++
++    case BuiltinType::Char_S:
++    case BuiltinType::WChar_S:
++      ShortQT = C.ShortTy;
++      break;
++
++    case BuiltinType::WChar_U:
++      ShortQT = C.UnsignedShortTy;
++      break;
++
++    default:
++      return QT.getAsOpaquePtr();
++  }
++
++  ShortQT = C.getQualifiedType(ShortQT, QT.getQualifiers());
++  return ShortQT.getAsOpaquePtr();
++}
++
++TCppType_t GetLongType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++
++  const BuiltinType* BT = QT->getAs<BuiltinType>();
++  if (!BT)
++    return QT.getAsOpaquePtr();
++
++  ASTContext& C = getSema().getASTContext();
++
++  QualType LongQT;
++  switch (BT->getKind()) {
++    case BuiltinType::Long:
++    case BuiltinType::ULong:
++      return QT.getAsOpaquePtr();
++
++    case BuiltinType::SChar:
++    case BuiltinType::Short:
++    case BuiltinType::Int:
++    case BuiltinType::LongLong:
++    case BuiltinType::Int128:
++    case BuiltinType::Char_S:
++    case BuiltinType::WChar_S:
++      LongQT = C.LongTy;
++      break;
++
++    case BuiltinType::UChar:
++    case BuiltinType::Char_U:
++    case BuiltinType::UShort:
++    case BuiltinType::UInt:
++    case BuiltinType::ULongLong:
++    case BuiltinType::UInt128:
++    case BuiltinType::WChar_U:
++      LongQT = C.UnsignedLongTy;
++      break;
++
++    case BuiltinType::Double:
++      LongQT = C.LongDoubleTy;
++      break;
++
++    default:
++      return QT.getAsOpaquePtr();
++  }
++
++  LongQT = C.getQualifiedType(LongQT, QT.getQualifiers());
++  return LongQT.getAsOpaquePtr();
++}
++
++bool IsShortType(TCppType_t type) {
++  QualType QT = QualType::getFromOpaquePtr(type);
++
++  const BuiltinType* BT = QT->getAs<BuiltinType>();
++  if (!BT)
++    return QT.getAsOpaquePtr();
++
++  switch (BT->getKind()) {
++    case BuiltinType::Short:
++    case BuiltinType::UShort:
++      return true;
++    default:
++      return false;
++  }
++}
++
++std::string GetTypeAsTruncatedString(TCppType_t var) {
++  QualType QT = QualType::getFromOpaquePtr(var);
++  // FIXME: Get the default printing policy from the ASTContext.
++  PrintingPolicy Policy((LangOptions()));
++  Policy.Bool = true;               // Print bool instead of _Bool.
++  Policy.SuppressTagKeyword = true; // Do not print `class std::string`.
++  Policy.SuppressScope = true;
++  Policy.FullyQualifiedName = false;
++  return TruncateTypeString(QT.getAsString(Policy));
++}
++
++static QualType findBuiltinType(llvm::StringRef typeName, ASTContext& Context) {
++  bool issigned = false;
++  bool isunsigned = false;
++  if (typeName.starts_with("signed ")) {
++    issigned = true;
++    typeName = StringRef(typeName.data() + 7, typeName.size() - 7);
++  }
++  if (!issigned && typeName.starts_with("unsigned ")) {
++    isunsigned = true;
++    typeName = StringRef(typeName.data() + 9, typeName.size() - 9);
++  }
++  if (typeName == "char") {
++    if (isunsigned)
++      return Context.UnsignedCharTy;
++    return Context.SignedCharTy;
++  }
++  if (typeName == "short") {
++    if (isunsigned)
++      return Context.UnsignedShortTy;
++    return Context.ShortTy;
++  }
++  if (typeName == "int") {
++    if (isunsigned)
++      return Context.UnsignedIntTy;
++    return Context.IntTy;
++  }
++  if (typeName == "long") {
++    if (isunsigned)
++      return Context.UnsignedLongTy;
++    return Context.LongTy;
++  }
++  if (typeName == "long long") {
++    if (isunsigned)
++      return Context.UnsignedLongLongTy;
++    return Context.LongLongTy;
++  }
++  if (!issigned && !isunsigned) {
++    if (typeName == "bool")
++      return Context.BoolTy;
++    if (typeName == "float")
++      return Context.FloatTy;
++    if (typeName == "double")
++      return Context.DoubleTy;
++    if (typeName == "long double")
++      return Context.LongDoubleTy;
++
++    if (typeName == "wchar_t")
++      return Context.WCharTy;
++    if (typeName == "char16_t")
++      return Context.Char16Ty;
++    if (typeName == "char32_t")
++      return Context.Char32Ty;
++  }
++  /* Missing
++ CanQualType WideCharTy; // Same as WCharTy in C++, integer type in C99.
++ CanQualType WIntTy;   // [C99 7.24.1], integer type unchanged by default
++ promotions.
++   */
++  return QualType();
++}
++
++TCppType_t GetType(const std::string& name) {
++  QualType builtin = findBuiltinType(name, getASTContext());
++  if (!builtin.isNull())
++    return builtin.getAsOpaquePtr();
++
++  auto* D = (Decl*)GetNamed(name, /* Within= */ 0);
++  if (auto* TD = llvm::dyn_cast_or_null<TypeDecl>(D)) {
++    QualType QT(getASTContext().getTypeDeclType(TD));
++    return QT.getAsOpaquePtr();
++  }
++
++  return (TCppType_t)0;
++}
++
++bool IsTriviallyDestructible(TCppType_t type) {
++  QualType T =
++      QualType::getFromOpaquePtr(type).getDesugaredType(getASTContext());
++
++  if (const auto* RD = T->getAsCXXRecordDecl()) {
++    return RD->hasTrivialDestructor();
++  }
++
++  return T.isDestructedType() == clang::QualType::DK_none;
++}
++
++static Decl* InstantiateTemplate(TemplateDecl* TemplateD,
++                                  TemplateArgumentListInfo& TLI, Sema& S,
++                                  bool instantiate_body) {
++  SourceLocation fakeLoc = GetValidSLoc(S);
++  if (auto* FunctionTemplate = dyn_cast<FunctionTemplateDecl>(TemplateD)) {
++    FunctionDecl* Specialization = nullptr;
++    clang::sema::TemplateDeductionInfo Info(fakeLoc);
++    TemplateDeductionResult Result =
++        S.DeduceTemplateArguments(FunctionTemplate, &TLI, Specialization, Info,
++                                   /*IsAddressOfFunction*/ true);
++    if (Result != TemplateDeductionResult::Success)
++      return nullptr;
++    if (instantiate_body)
++      InstantiateFunctionDefinition(Specialization);
++    return Specialization;
++  }
++
++  if (auto* VarTemplate = dyn_cast<VarTemplateDecl>(TemplateD)) {
++    DeclResult R =
++        S.CheckVarTemplateId(VarTemplate, fakeLoc, fakeLoc, TLI, false);
++    if (R.isInvalid())
++      return nullptr;
++    return R.get();
++  }
++
++  SourceLocation noLoc;
++  QualType TT = S.CheckTemplateIdType(ElaboratedTypeKeyword::None,
++                                       TemplateName(TemplateD), noLoc, TLI,
++                                       nullptr, false);
++  if (TT.isNull())
++    return nullptr;
++
++  S.RequireCompleteType(fakeLoc, TT, diag::err_tentative_def_incomplete_type);
++
++  // RequireCompleteType instantiates the class shell and field decls, but
++  // NSDMIs (default member initializers) are only checked lazily, when the
++  // implicit default constructor is actually defined.
++  if (CXXRecordDecl* RD = TT->getAsCXXRecordDecl()) {
++    RD = RD->getDefinition();
++    if (RD && !RD->isInvalidDecl()) {
++      S.ForceDeclarationOfImplicitMembers(RD);
++      if (CXXConstructorDecl* Ctor = S.LookupDefaultConstructor(RD)) {
++        S.MarkFunctionReferenced(fakeLoc, Ctor);
++        if (Ctor->isDefaulted() && !Ctor->isDeleted() && !Ctor->isDefined())
++          S.DefineImplicitDefaultConstructor(fakeLoc, Ctor);
++      }
++    }
++  }
++
++  return GetScopeFromType(TT);
++}
++
++Decl* InstantiateTemplate(TemplateDecl* TemplateD,
++                          ArrayRef<TemplateArgument> TemplateArgs, Sema& S,
++                          bool instantiate_body) {
++  // Create a list of template arguments.
++  TemplateArgumentListInfo TLI{};
++  for (auto TA : TemplateArgs)
++    TLI.addArgument(
++        S.getTrivialTemplateArgumentLoc(TA, QualType(), SourceLocation()));
++
++  return InstantiateTemplate(TemplateD, TLI, S, instantiate_body);
++}
++
++TCppScope_t InstantiateTemplate(compat::Interpreter& I, TCppScope_t tmpl,
++                                const TemplateArgInfo* template_args,
++                                size_t template_args_size,
++                                bool instantiate_body) {
++  auto& S = I.getSema();
++  llvm::SmallVector<TemplateArgument> TemplateArgs;
++  auto* TemplateD = static_cast<TemplateDecl*>(tmpl);
++  if (CompleteTemplateArguments(S, TemplateD, template_args, template_args_size,
++                                TemplateArgs)) {
++    return nullptr;
++  }
++
++  // We will create a new decl, push a transaction.
++  compat::SynthesizingCodeRAII RAII(&getInterp());
++  return InstantiateTemplate(TemplateD, TemplateArgs, S, instantiate_body);
++}
++
++TCppScope_t InstantiateTemplate(TCppScope_t tmpl,
++                                const TemplateArgInfo* template_args,
++                                size_t template_args_size,
++                                bool instantiate_body) {
++  return InstantiateTemplate(getInterp(), tmpl, template_args,
++                             template_args_size, instantiate_body);
++}
++
++bool InstantiateTemplate(TCppScope_t spec) {
++  clang::Sema& S = getSema();
++  clang::QualType QT;
++  if (auto* D = llvm::dyn_cast<ClassTemplateSpecializationDecl>((Decl*)spec))
++    QT = S.Context.getCanonicalTagType(D);
++  else if (auto* D = llvm::dyn_cast<FunctionTemplateDecl>((Decl*)spec))
++    QT = D->getTemplatedDecl()->getType();
++  else if (auto* D = llvm::dyn_cast<CXXConstructorDecl>((Decl*)spec))
++    QT = S.Context.getCanonicalTagType(D->getParent());
++  else if (auto* D = llvm::dyn_cast<FunctionDecl>((Decl*)spec))
++    QT = D->getType();
++
++  if (QT.isNull())
++    return true;
++
++  clang::DiagnosticErrorTrap Trap(S.getDiagnostics());
++  bool R = S.RequireCompleteType(clang::SourceLocation(), QT,
++                                 /*DiagID*/ 0 /*no diagnostic*/);
++
++  if (!R) {
++    if (auto* FD = llvm::dyn_cast<FunctionDecl>((Decl*)spec)) {
++      return InstantiateFunction(FD);
++    }
++  }
++
++  return R || Trap.hasErrorOccurred();
++}
++
++static bool CompleteTemplateArguments(Sema& S, TemplateDecl* TemplateD,
++                                      const TemplateArgInfo* template_args,
++                                      size_t template_args_size,
++                                      SmallVectorImpl<TemplateArgument>& args) {
++  ASTContext& C = S.getASTContext();
++  TemplateArgumentListInfo TLI{};
++  for (size_t i = 0; i < template_args_size; ++i) {
++    QualType ArgTy = QualType::getFromOpaquePtr(template_args[i].m_Type);
++    TemplateArgument Arg;
++    if (template_args[i].m_IntegralValue) {
++      // We have a non-type template parameter. Create an integral value from
++      // the string representation.
++      auto Res = llvm::APSInt(template_args[i].m_IntegralValue);
++      Res = Res.extOrTrunc(C.getIntWidth(ArgTy));
++      Arg = TemplateArgument(C, Res, ArgTy);
++    } else {
++      Arg = TemplateArgument(ArgTy);
++    }
++    TLI.addArgument(
++        S.getTrivialTemplateArgumentLoc(Arg, ArgTy, SourceLocation()));
++  }
++
++  Sema::CheckTemplateArgumentInfo CTAI;
++  if (S.CheckTemplateArgumentList(TemplateD, TemplateD->getLocation(), TLI,
++                                  DefaultArguments{},
++                                  /*PartialTemplateArgs=*/false, CTAI)) {
++    return true;
++  }
++
++  for (const auto& Arg : CTAI.SugaredConverted) {
++    if (Arg.getKind() == TemplateArgument::Pack) {
++      args.append(Arg.pack_elements().begin(), Arg.pack_elements().end());
++    } else {
++      args.push_back(Arg);
++    }
++  }
++  return false;
++}
++
++bool InstantiateFunction(clang::FunctionDecl* FD) {
++  // Ignore if not a template instantiation
++  if (!(FD->isTemplateInstantiation() && !FD->isDefined()))
++    return false;
++
++  clang::Sema& S = getSema();
++  clang::DiagnosticErrorTrap Trap(S.getDiagnostics());
++
++  S.InstantiateFunctionDefinition(FD->getLocation(), FD, /*Recursive=*/true,
++                                  /*DefinitionRequired=*/true);
++
++  return Trap.hasErrorOccurred();
++}
++
++OperatorArity GetOperatorArity(TCppFunction_t op) {
++  Decl* D = static_cast<Decl*>(op);
++  if (auto* FD = llvm::dyn_cast<FunctionDecl>(D)) {
++    if (FD->isOverloadedOperator()) {
++      switch (FD->getOverloadedOperator()) {
++#define OVERLOADED_OPERATOR(Name, Spelling, Token, Unary, Binary, MemberOnly)  \
++  case OO_##Name:                                                              \
++    if ((Unary) && (Binary))                                                   \
++      return kBoth;                                                            \
++    if (Unary)                                                                 \
++      return kUnary;                                                           \
++    if (Binary)                                                                \
++      return kBinary;                                                          \
++    break;
++#include "clang/Basic/OperatorKinds.def"
++      default:
++        break;
++      }
++    }
++  }
++  return (OperatorArity)~0U;
++}
++
++void GetOperator(Operator op, std::vector<TCppType_t> const& arg_types,
++                 std::vector<TCppFunction_t>& operators, OperatorArity kind) {
++  Sema& S = getSema();
++  ASTContext& Ctx = S.Context;
++
++  const auto Op = static_cast<OverloadedOperatorKind>(op);
++  DeclarationName OpName = Ctx.DeclarationNames.getCXXOperatorName(Op);
++
++  llvm::SmallPtrSet<const NamedDecl*, 32> Seen;
++
++  auto pushIfNew = [&](NamedDecl* ND) {
++    if (!ND)
++      return;
++    if (Seen.insert(ND).second) {
++      if (kind & GetOperatorArity(ND))
++        operators.push_back(ND);
++    }
++  };
++
++  UnresolvedSet<16> Fns;
++  S.LookupOverloadedOperatorName(Op, S.getCurScope(), Fns);
++  for (auto I = Fns.begin(); I != Fns.end(); ++I) {
++    if (auto* FTD = llvm::dyn_cast<FunctionTemplateDecl>(I.getPair().getDecl()))
++      pushIfNew(FTD);
++    else
++      pushIfNew(I.getPair().getDecl()->getUnderlyingDecl());
++  }
++
++  // --- 1) Build operand exprs (types must be exactly your operands).
++  llvm::SmallVector<Expr*, 2> ArgExprs;
++  ArgExprs.reserve(arg_types.size());
++  for (auto const& arg_type : arg_types) {
++    QualType T = QualType::getFromOpaquePtr(arg_type);
++    T = Ctx.getCanonicalType(T).getUnqualifiedType().getNonReferenceType();
++    ArgExprs.push_back(new (Ctx)
++                           OpaqueValueExpr(SourceLocation(), T, VK_LValue));
++  }
++
++  // --- 2) Collect associated namespaces/classes for ADL.
++  Sema::AssociatedNamespaceSet ANS;
++  Sema::AssociatedClassSet ACS;
++  S.FindAssociatedClassesAndNamespaces(SourceLocation(), ArgExprs, ANS, ACS);
++
++  // --- 3) Search each associated namespace (PRIMARY context, via Sema).
++  for (auto* NS : ANS) {
++    DeclContext* PC = NS->getPrimaryContext();
++    LookupResult LR(S, OpName, SourceLocation(), Sema::LookupOperatorName);
++    S.LookupQualifiedName(LR, PC);
++    for (NamedDecl* ND : LR) {
++      if (auto* FTD = dyn_cast<FunctionTemplateDecl>(ND))
++        pushIfNew(FTD);
++      else if (auto* FD = dyn_cast<FunctionDecl>(ND))
++        pushIfNew(FD);
++    }
++  }
++
++  // --- 4) Search each associated class:
++  //       a) member operators (rare for != here)
++  //       b) hidden friends declared inside the class (ADL-only)
++  for (CXXRecordDecl* RD : ACS) {
++    // Some operators are implicitly defined, in some scenarios, such as operator=.
++    // We need to trigger the declaration of these so that they can show up
++    // as candidate overloads.
++    S.ForceDeclarationOfImplicitMembers(RD);
++
++    DeclContext* PC = RD->getPrimaryContext();
++
++    // a) any member operator!= (unlikely for __normal_iterator, but cheap)
++    for (NamedDecl* ND : PC->lookup(OpName)) {
++      if (auto* FTD = dyn_cast<FunctionTemplateDecl>(ND))
++        pushIfNew(FTD);
++      else if (auto* FD = dyn_cast<FunctionDecl>(ND))
++        pushIfNew(FD);
++    }
++
++    // b) hidden friends: these are NOT found by ordinary lookup
++    for (FriendDecl* F : RD->friends()) {
++      if (auto* FriendND = dyn_cast_or_null<NamedDecl>(F->getFriendDecl())) {
++        auto name = FriendND->getDeclName();
++        if (name.getCXXOverloadedOperator() == Op) {
++          if (auto* FTD = dyn_cast<FunctionTemplateDecl>(FriendND))
++            pushIfNew(FTD);
++          else if (auto* FD = dyn_cast<FunctionDecl>(FriendND))
++            pushIfNew(FD);
++        }
++      }
++    }
++  }
++}
++
++TCppType_t GetBuiltinOperatorType(Operator op,
++                                  std::vector<TCppType_t> const& arg_types) {
++  Sema& S = getSema();
++  ASTContext& Ctx = S.getASTContext();
++
++  llvm::SmallVector<Expr*, 2> ArgExprs;
++  ArgExprs.reserve(arg_types.size());
++  for (auto const arg_type : arg_types) {
++    QualType T = QualType::getFromOpaquePtr(arg_type);
++    if (T.isNull())
++      return nullptr;
++
++    // Operator operands are expressions, so references are represented by their
++    // referred-to type while cv-qualifiers remain significant.
++    auto const is_lvalue_reference = T->isLValueReferenceType();
++    T = T.getNonReferenceType();
++    auto const value_kind{
++      T->isNullPtrType() && !is_lvalue_reference ? VK_PRValue : VK_LValue
++    };
++    ArgExprs.push_back(new (Ctx)
++                           OpaqueValueExpr(SourceLocation(), T, value_kind));
++  }
++
++  auto build_unary = [&](UnaryOperatorKind unary_op) -> TCppType_t {
++    if (ArgExprs.size() != 1)
++      return nullptr;
++
++    clangSilent diag_suppr{S.getDiagnostics()};
++    auto const result{
++      S.CreateBuiltinUnaryOp(SourceLocation(), unary_op, ArgExprs.front())
++    };
++    if (result.isInvalid())
++      return nullptr;
++
++    return result.get()->getType().getAsOpaquePtr();
++  };
++
++  auto build_binary = [&](BinaryOperatorKind binary_op) -> TCppType_t {
++    if (ArgExprs.size() != 2)
++      return nullptr;
++
++    clangSilent diag_suppr{S.getDiagnostics()};
++    auto const result{
++      S.CreateBuiltinBinOp(SourceLocation(), binary_op, ArgExprs[0], ArgExprs[1])
++    };
++    if (result.isInvalid())
++      return nullptr;
++
++    return result.get()->getType().getAsOpaquePtr();
++  };
++
++  auto build_subscript = [&]() -> TCppType_t {
++    if (ArgExprs.size() != 2)
++      return nullptr;
++
++    clangSilent diag_suppr{S.getDiagnostics()};
++    auto const result{ S.CreateBuiltinArraySubscriptExpr(ArgExprs[0],
++                                                        SourceLocation(),
++                                                        ArgExprs[1],
++                                                        SourceLocation()) };
++    if (result.isInvalid())
++      return nullptr;
++
++    return result.get()->getType().getAsOpaquePtr();
++  };
++
++  switch (op) {
++  case OP_Plus:
++    if (ArgExprs.size() == 1)
++      return build_unary(UO_Plus);
++    return build_binary(BO_Add);
++  case OP_Minus:
++    if (ArgExprs.size() == 1)
++      return build_unary(UO_Minus);
++    return build_binary(BO_Sub);
++  case OP_Star:
++    if (ArgExprs.size() == 1)
++      return build_unary(UO_Deref);
++    return build_binary(BO_Mul);
++  case OP_Slash:
++    return build_binary(BO_Div);
++  case OP_Percent:
++    return build_binary(BO_Rem);
++  case OP_Caret:
++    return build_binary(BO_Xor);
++  case OP_Amp:
++    if (ArgExprs.size() == 1)
++      return build_unary(UO_AddrOf);
++    return build_binary(BO_And);
++  case OP_Pipe:
++    return build_binary(BO_Or);
++  case OP_Tilde:
++    return build_unary(UO_Not);
++  case OP_Exclaim:
++    return build_unary(UO_LNot);
++  case OP_Equal:
++    return build_binary(BO_Assign);
++  case OP_Less:
++    return build_binary(BO_LT);
++  case OP_Greater:
++    return build_binary(BO_GT);
++  case OP_PlusEqual:
++    return build_binary(BO_AddAssign);
++  case OP_MinusEqual:
++    return build_binary(BO_SubAssign);
++  case OP_StarEqual:
++    return build_binary(BO_MulAssign);
++  case OP_SlashEqual:
++    return build_binary(BO_DivAssign);
++  case OP_PercentEqual:
++    return build_binary(BO_RemAssign);
++  case OP_CaretEqual:
++    return build_binary(BO_XorAssign);
++  case OP_AmpEqual:
++    return build_binary(BO_AndAssign);
++  case OP_PipeEqual:
++    return build_binary(BO_OrAssign);
++  case OP_LessLess:
++    return build_binary(BO_Shl);
++  case OP_GreaterGreater:
++    return build_binary(BO_Shr);
++  case OP_LessLessEqual:
++    return build_binary(BO_ShlAssign);
++  case OP_GreaterGreaterEqual:
++    return build_binary(BO_ShrAssign);
++  case OP_EqualEqual:
++    return build_binary(BO_EQ);
++  case OP_ExclaimEqual:
++    return build_binary(BO_NE);
++  case OP_LessEqual:
++    return build_binary(BO_LE);
++  case OP_GreaterEqual:
++    return build_binary(BO_GE);
++  case OP_AmpAmp:
++    return build_binary(BO_LAnd);
++  case OP_PipePipe:
++    return build_binary(BO_LOr);
++  case OP_PlusPlus:
++    return build_unary(UO_PreInc);
++  case OP_MinusMinus:
++    return build_unary(UO_PreDec);
++  case OP_Subscript:
++    return build_subscript();
++  default:
++    return nullptr;
++  }
++}
++std::string DetectResourceDir(const char* ClangBinaryName /* = clang */) {
++  return Cpp::DetectResourceDir(ClangBinaryName);
++}
++
++void DumpScope(TCppScope_t scope) {
++  Cpp::DumpScope(Cpp::ConstDeclRef(scope));
++}
++
++void EnableDebugOutput(bool value /* =true*/) {
++  Cpp::EnableDebugOutput(value);
++}
++
++TCppScope_t GetBaseClass(TCppScope_t klass, TCppIndex_t ibase) {
++  return Cpp::GetBaseClass(Cpp::ConstDeclRef(klass), ibase) .data;
++}
++
++TCppType_t GetCanonicalType(TCppType_t type) {
++  return Cpp::GetCanonicalType(Cpp::ConstTypeRef(type)) .data;
++}
++
++void GetDatamembers(TCppScope_t scope, std::vector<TCppScope_t>& datamembers) {
++  std::vector<Cpp::DeclRef> datamembers_refs;
++  Cpp::GetDatamembers(Cpp::DeclRef(scope), datamembers_refs);
++  datamembers = unbox(datamembers_refs);
++}
++
++std::string GetFunctionArgName(TCppFunction_t func, TCppIndex_t param_index) {
++  return Cpp::GetFunctionArgName(Cpp::ConstFuncRef(func), param_index);
++}
++
++TCppType_t GetFunctionArgType(TCppFunction_t func, TCppIndex_t iarg) {
++  return Cpp::GetFunctionArgType(Cpp::ConstFuncRef(func), iarg) .data;
++}
++
++TCppIndex_t GetFunctionNumArgs(TCppFunction_t func) {
++  return Cpp::GetFunctionNumArgs(Cpp::ConstFuncRef(func));
++}
++
++TCppIndex_t GetFunctionRequiredArgs(TCppConstFunction_t func) {
++  return Cpp::GetFunctionRequiredArgs(Cpp::ConstFuncRef(func));
++}
++
++TCppType_t GetFunctionReturnType(TCppFunction_t func) {
++  auto* D = (clang::Decl*)func;
++  if (auto* FD = llvm::dyn_cast_or_null<clang::FunctionDecl>(D)) {
++    QualType Type = FD->getReturnType();
++    if (Type->isUndeducedAutoType()) {
++      bool needInstantiation = false;
++      if (IsTemplatedFunction(FD) && !FD->isDefined())
++        needInstantiation = true;
++      if (auto* MD = llvm::dyn_cast<clang::CXXMethodDecl>(FD)) {
++        if (IsTemplateSpecialization(MD->getParent()))
++          needInstantiation = true;
++      }
++
++      if (needInstantiation) {
++        InstantiateFunctionDefinition(FD);
++      }
++      Type = FD->getReturnType();
++    }
++    return Type.getAsOpaquePtr();
++  }
++
++  if (auto* FD = llvm::dyn_cast_or_null<clang::FunctionTemplateDecl>(D))
++    return (FD->getTemplatedDecl())->getReturnType().getAsOpaquePtr();
++
++  return 0;
++}
++
++std::string GetFunctionSignature(TCppFunction_t func) {
++  return Cpp::GetFunctionSignature(Cpp::ConstFuncRef(func));
++}
++
++std::vector<TCppFunction_t> GetFunctionsUsingName(TCppScope_t scope,
++                                                   const std::string& name) {
++  auto* D = (Decl*)scope;
++
++  if (!scope || name.empty())
++    return {};
++
++  D = GetUnderlyingScope(D);
++
++  // Not every Decl doubles as a DeclContext (e.g. VarDecl, FieldDecl,
++  // EnumConstantDecl). Only DeclContext-capable decls can be looked into.
++  if (!D || !llvm::isa<DeclContext>(D))
++    return {};
++
++  std::vector<TCppFunction_t> funcs;
++  llvm::StringRef Name(name);
++  auto& S = getSema();
++  DeclarationName DName = &getASTContext().Idents.get(name);
++  clang::LookupResult R(S, DName, SourceLocation(), Sema::LookupOrdinaryName,
++                        RedeclarationKind::ForVisibleRedeclaration);
++
++  CppInternal::utils::Lookup::Named(&S, R, Decl::castToDeclContext(D));
++
++  if (R.empty())
++    return funcs;
++
++  R.resolveKind();
++
++  for (auto* Found : R)
++    if (llvm::isa<FunctionDecl>(Found) ||
++        llvm::isa<FunctionTemplateDecl>(Found))
++      funcs.push_back(Found);
++
++  return funcs;
++}
++
++TCppScope_t GetGlobalScope() {
++  return Cpp::GetGlobalScope() .data;
++}
++
++std::string GetName(TCppType_t klass) {
++  return Cpp::GetName(Cpp::ConstDeclRef(klass));
++}
++
++TCppScope_t GetNamed(const std::string& name,
++                     TCppScope_t parent /*= nullptr*/) {
++  return Cpp::GetNamed(name, Cpp::ConstDeclRef(parent)) .data;
++}
++
++TCppType_t GetNonReferenceType(TCppType_t type) {
++  if (!IsReferenceType(type))
++    return type;
++  QualType QT = QualType::getFromOpaquePtr(type);
++  return QT.getNonReferenceType().getAsOpaquePtr();
++}
++
++TCppIndex_t GetNumBases(TCppScope_t klass) {
++  return Cpp::GetNumBases(Cpp::ConstDeclRef(klass));
++}
++
++TCppScope_t GetParentScope(TCppScope_t scope) {
++  return Cpp::GetParentScope(Cpp::ConstDeclRef(scope)) .data;
++}
++
++TCppType_t GetPointeeType(TCppType_t type) {
++  if (IsArrayType(type))
++    return GetArrayElementType(type);
++  if (!IsPointerType(type))
++    return nullptr;
++  QualType QT = QualType::getFromOpaquePtr(type);
++  return QT->getPointeeType().getAsOpaquePtr();
++}
++
++TCppType_t GetPointerType(TCppType_t type) {
++  return Cpp::GetPointerType(Cpp::ConstTypeRef(type)) .data;
++}
++
++std::string GetQualifiedCompleteName(TCppType_t klass) {
++  return Cpp::GetQualifiedCompleteName(Cpp::ConstDeclRef(klass));
++}
++
++std::string GetQualifiedName(TCppType_t klass) {
++  return Cpp::GetQualifiedName(Cpp::ConstDeclRef(klass));
++}
++
++TCppScope_t GetScopeFromCompleteName(const std::string& name) {
++  return Cpp::GetScopeFromCompleteName(name) .data;
++}
++
++void GetStaticDatamembers(TCppScope_t scope,
++                          std::vector<TCppScope_t>& datamembers) {
++  std::vector<Cpp::DeclRef> datamembers_refs;
++  Cpp::GetStaticDatamembers(Cpp::ConstDeclRef(scope), datamembers_refs);
++  datamembers = unbox(datamembers_refs);
++}
++
++std::string GetTypeAsString(TCppType_t var) {
++  return Cpp::GetTypeAsString(Cpp::ConstTypeRef(var));
++}
++
++TCppType_t GetTypeFromScope(TCppScope_t klass) {
++  if (!klass)
++    return 0;
++
++  auto* D = (Decl*)klass;
++  auto& C = getASTContext();
++
++  if (auto* FTD = dyn_cast<FunctionTemplateDecl>(D)) {
++    FunctionDecl* FD = FTD->getTemplatedDecl();
++    if (FD) {
++      return C.getPointerType(FD->getType()).getAsOpaquePtr();
++    }
++    return 0;
++  }
++  if (auto* FD = dyn_cast<FunctionDecl>(D)) {
++    return C.getPointerType(FD->getType()).getAsOpaquePtr();
++  }
++  if (ValueDecl* VD = dyn_cast<ValueDecl>(D))
++    return VD->getType().getAsOpaquePtr();
++  if (auto* CTD = dyn_cast<ClassTemplateDecl>(D)) {
++    CXXRecordDecl* RD = CTD->getTemplatedDecl();
++    if (RD) {
++      return C.getCanonicalTagType(RD).getAsOpaquePtr();
++    }
++    return 0;
++  }
++
++  if (auto* TD = dyn_cast<TypeDecl>(D))
++    return getASTContext().getTypeDeclType(TD).getAsOpaquePtr();
++
++  return (TCppType_t) nullptr;
++}
++
++ValueKind GetValueKind(TCppType_t type) {
++  return static_cast<ValueKind>(Cpp::GetValueKind(Cpp::ConstTypeRef(type)));
++}
++
++bool HasTypeQualifier(TCppType_t type, QualKind qual) {
++  return Cpp::HasTypeQualifier(Cpp::ConstTypeRef(type), static_cast<Cpp::QualKind>(qual));
++}
++
++bool IsBuiltin(TCppType_t type) {
++  return Cpp::IsBuiltin(Cpp::ConstTypeRef(type));
++}
++
++bool IsClass(TCppScope_t scope) {
++  return Cpp::IsClass(Cpp::ConstDeclRef(scope));
++}
++
++bool IsComplete(TCppScope_t scope) {
++  return Cpp::IsComplete(Cpp::ConstDeclRef(scope));
++}
++
++bool IsConstMethod(TCppFunction_t method) {
++  return Cpp::IsConstMethod(Cpp::ConstFuncRef(method));
++}
++
++bool IsConstructor(TCppConstFunction_t method) {
++  return Cpp::IsConstructor(Cpp::ConstFuncRef(method));
++}
++
++bool IsDestructor(TCppConstFunction_t method) {
++  return Cpp::IsDestructor(Cpp::ConstFuncRef(method));
++}
++
++bool IsEnumConstant(TCppScope_t handle) {
++  return Cpp::IsEnumConstant(Cpp::ConstDeclRef(handle));
++}
++
++bool IsEnumScope(TCppScope_t handle) {
++  return Cpp::IsEnumScope(Cpp::ConstDeclRef(handle));
++}
++
++bool IsEnumType(TCppType_t type) {
++  return Cpp::IsEnumType(Cpp::ConstTypeRef(type));
++}
++
++bool IsFunction(TCppScope_t scope) {
++  return Cpp::IsFunction(Cpp::ConstDeclRef(scope));
++}
++
++bool IsFunctionDeleted(TCppConstFunction_t func) {
++  return Cpp::IsFunctionDeleted(Cpp::ConstFuncRef(func));
++}
++
++bool IsFunctionPointerType(TCppType_t type) {
++  return Cpp::IsFunctionPointerType(Cpp::ConstTypeRef(type));
++}
++
++bool IsMethod(TCppConstFunction_t method) {
++  return Cpp::IsMethod(Cpp::ConstFuncRef(method));
++}
++
++bool IsNamespace(TCppScope_t scope) {
++  return Cpp::IsNamespace(Cpp::ConstDeclRef(scope));
++}
++
++bool IsPointerType(TCppType_t type) {
++  return Cpp::IsPointerType(Cpp::ConstTypeRef(type));
++}
++
++bool IsPrivateMethod(TCppFunction_t method) {
++  return Cpp::IsPrivateMethod(Cpp::ConstFuncRef(method));
++}
++
++bool IsPrivateVariable(TCppScope_t var) {
++  return Cpp::IsPrivateVariable(Cpp::ConstDeclRef(var));
++}
++
++bool IsProtectedMethod(TCppFunction_t method) {
++  return Cpp::IsProtectedMethod(Cpp::ConstFuncRef(method));
++}
++
++bool IsProtectedVariable(TCppScope_t var) {
++  return Cpp::IsProtectedVariable(Cpp::ConstDeclRef(var));
++}
++
++bool IsReferenceType(TCppType_t type) {
++  return Cpp::IsReferenceType(Cpp::ConstTypeRef(type));
++}
++
++bool IsStaticMethod(TCppConstFunction_t method) {
++  return Cpp::IsStaticMethod(Cpp::ConstFuncRef(method));
++}
++
++bool IsStaticVariable(TCppScope_t var) {
++  return Cpp::IsStaticVariable(Cpp::ConstDeclRef(var));
++}
++
++bool IsTemplate(TCppScope_t handle) {
++  return Cpp::IsTemplate(Cpp::ConstDeclRef(handle));
++}
++
++bool IsTemplateSpecialization(TCppScope_t handle) {
++  return Cpp::IsTemplateSpecialization(Cpp::ConstDeclRef(handle));
++}
++
++bool IsTemplatedFunction(Decl* D) {
++  return Cpp::IsTemplatedFunction(Cpp::ConstFuncRef(D));
++}
++
++bool IsTemplatedFunction(TCppFunction_t func) {
++  return Cpp::IsTemplatedFunction(Cpp::ConstFuncRef(func));
++}
++
++bool IsTypeDerivedFrom(TCppType_t derived, TCppType_t base) {
++  return Cpp::IsTypeDerivedFrom(Cpp::ConstTypeRef(derived), Cpp::ConstTypeRef(base));
++}
++
++bool IsTypedefed(TCppScope_t handle) {
++  return Cpp::IsTypedefed(Cpp::ConstDeclRef(handle));
++}
++
++bool IsVariable(TCppScope_t scope) {
++  return Cpp::IsVariable(Cpp::ConstDeclRef(scope));
++}
++
++void LookupConstructors(const std::string& name, TCppScope_t parent,
++                        std::vector<TCppFunction_t>& funcs) {
++  auto* D = (Decl*)parent;
++
++  if (auto* CXXRD = llvm::dyn_cast_or_null<CXXRecordDecl>(D)) {
++    getSema().ForceDeclarationOfImplicitMembers(CXXRD);
++    DeclContextLookupResult Result = getSema().LookupConstructors(CXXRD);
++    for (auto* i : Result)
++      funcs.push_back(i);
++  }
++}
++
++TCppScope_t LookupDatamember(const std::string& name, TCppScope_t parent) {
++  return Cpp::LookupDatamember(name, Cpp::ConstDeclRef(parent)) .data;
++}
++// Clang setup owned by jank: upstream's public constructor cannot supply an
++// embedded PCH filesystem, a code model, or stale-PCH diagnostics.
++namespace {
++// Match CppInterOp 2.0.0's LLVM-23 lifetime policy: LLVM's late static
++// destruction cannot safely tear down a JIT. Explicit deletion remains
++// available for tests and hosts that shut down before their LLVM globals.
++llvm::ManagedStatic<std::unique_ptr<compat::Interpreter>> owned_interpreter;
++
++class PCHStalenessDiagnosticConsumer final : public clang::DiagnosticConsumer {
++  clang::DiagnosticConsumer &target;
++  bool &out_of_date;
++public:
++  PCHStalenessDiagnosticConsumer(clang::DiagnosticConsumer &target, bool &out_of_date)
++    : target(target), out_of_date(out_of_date) {}
++  void BeginSourceFile(clang::LangOptions const &opts, clang::Preprocessor const *pp = nullptr) override {
++    target.BeginSourceFile(opts, pp);
++  }
++  void EndSourceFile() override { target.EndSourceFile(); }
++  bool IncludeInDiagnosticCounts() const override { return target.IncludeInDiagnosticCounts(); }
++  void HandleDiagnostic(clang::DiagnosticsEngine::Level level, clang::Diagnostic const &info) override {
++    if(info.getID() == clang::diag::err_fe_ast_file_modified
++       || info.getID() == clang::diag::note_fe_ast_file_modified) out_of_date = true;
++    if(out_of_date) return;
++    clang::DiagnosticConsumer::HandleDiagnostic(level, info);
++    target.HandleDiagnostic(level, info);
++  }
++};
++}
++
++TInterp_t CreateInterpreter(std::vector<char const*> const &args,
++                           std::vector<char const*> const &gpu_args,
++                           std::map<char const*, std::string_view> const &vfs,
++                           std::optional<int> const &cm, bool *pch_out_of_date) {
++  if(pch_out_of_date) *pch_out_of_date = false;
++  if(!gpu_args.empty()) {
++    llvm::errs() << "jank's interpreter adapter does not support GPU arguments\n";
++    return nullptr;
++  }
++  // Initialize CppInterOp's targets before constructing the Clang interpreter.
++  if(Cpp::GetInterpreter()) {
++    llvm::errs() << "jank's interpreter is already initialized\n";
++    return nullptr;
++  }
++  clang::IncrementalCompilerBuilder builder;
++  builder.SetCompilerArgs(args);
++  auto ci = builder.CreateCpp();
++  if(!ci) {
++    llvm::logAllUnhandledErrors(ci.takeError(), llvm::errs(), "Cannot create jank compiler: ");
++    return nullptr;
++  }
++  (*ci)->LoadRequestedPlugins();
++  auto overlay = llvm::makeIntrusiveRefCnt<llvm::vfs::OverlayFileSystem>(llvm::vfs::getRealFileSystem());
++  auto memory = llvm::makeIntrusiveRefCnt<llvm::vfs::InMemoryFileSystem>();
++  for(auto const &[path, contents] : vfs) {
++    memory->addFile(path, 0, llvm::MemoryBuffer::getMemBuffer(
++      llvm::StringRef(contents.data(), contents.size()), path, false));
++  }
++  overlay->pushOverlay(memory);
++  (*ci)->createVirtualFileSystem(overlay);
++
++  // Keep the original client alive and restore it before returning: the caller's
++  // stale-PCH flag does not outlive this initialization attempt.
++  auto &diagnostics = (*ci)->getDiagnostics();
++  auto diagnostic_owner = diagnostics.takeClient();
++  auto *diagnostic_client = diagnostics.getClient();
++  bool stale{};
++  PCHStalenessDiagnosticConsumer consumer{*diagnostic_client, stale};
++  diagnostics.setClient(&consumer, false);
++  auto executor = std::make_unique<clang::IncrementalExecutorBuilder>();
++  if(cm) executor->CM = static_cast<llvm::CodeModel::Model>(*cm);
++  auto inner = clang::Interpreter::create(std::move(*ci), std::move(executor));
++  if(inner) {
++    if(diagnostic_owner) diagnostics.setClient(diagnostic_owner.release(), true);
++    else diagnostics.setClient(diagnostic_client, false);
++  }
++  if(pch_out_of_date) *pch_out_of_date = stale;
++  if(stale || !inner) {
++    if(!inner) {
++      if(stale) llvm::consumeError(inner.takeError());
++      else llvm::logAllUnhandledErrors(inner.takeError(), llvm::errs(), "Cannot create jank interpreter: ");
++    }
++    return nullptr;
++  }
++
++#ifdef __GLIBC__
++  CppInternal::installGlibcNonsharedSupport(*compat::getExecutionEngine(**inner), inner->get());
++#endif
++  *owned_interpreter = std::make_unique<compat::Interpreter>(std::move(*inner));
++  Cpp::UseExternalInterpreter(Cpp::InterpRef(owned_interpreter->get()));
++  auto *engine = (*owned_interpreter)->getExecutionEngine();
++  // These helpers are exported by the packaged library and are required by
++  // clang::Interpreter's expression-value lowering.
++  for(auto name : {"__ci_newtag", "__clang_Interpreter_SetValueWithAlloc", "__clang_Interpreter_SetValueNoAlloc"}) {
++    auto *address = llvm::sys::DynamicLibrary::SearchForAddressOfSymbol(name);
++    if(!address) llvm::report_fatal_error(llvm::Twine("Missing CppInterOp runtime helper: ") + name);
++    llvm::cantFail(engine->getProcessSymbolsJITDylib()->define(llvm::orc::absoluteSymbols({
++      {engine->mangleAndIntern(name), {llvm::orc::ExecutorAddr::fromPtr(address), llvm::JITSymbolFlags::Exported}}
++    })));
++  }
++  if(auto err = (*owned_interpreter)->ParseAndExecute(R"(
++    namespace __internal_CppInterOp {
++      template <typename Signature> struct function;
++      template <typename Res, typename... Args> struct function<Res(Args...)> { typedef Res result_type; };
++    }
++  )")) llvm::logAllUnhandledErrors(std::move(err), llvm::errs(), "Cannot initialize CppInterOp helpers: ");
++  return owned_interpreter->get();
++}
++
++bool DeleteInterpreter(TInterp_t interpreter) {
++  if(interpreter && interpreter != owned_interpreter->get()) return false;
++  if(!*owned_interpreter) return false;
++  Cpp::DeleteInterpreter(Cpp::InterpRef(owned_interpreter->get()));
++  owned_interpreter->reset();
++  return true;
++}
++
++} // namespace jank_cpp
+--- a/compiler+runtime/src/cpp/jank/analyze/processor.cpp
++++ b/compiler+runtime/src/cpp/jank/analyze/processor.cpp
+@@ -195,7 +195,7 @@
+ 
+   static processor::expression_result
+   build_builtin_operator_call(expr::cpp_value_ref const val,
+-                              Cpp::Operator const op,
++                              jank_cpp::Operator const op,
+                               native_vector<expression_ref> &&arg_exprs,
+                               std::vector<cppinterop::clang_type> const &arg_types,
+                               local_frame_ptr const current_frame,
+@@ -388,7 +388,7 @@
+       auto const obj_type{ cppinterop::get_non_reference_type(arg_types[0]) };
+       auto const op_name{ try_object<obj::symbol>(val->form)->name };
+       auto const op{ cpp_util::match_operator(op_name).unwrap() };
+-      auto const is_addressof{ op == Cpp::OP_Amp && arg_types.size() == 1 };
++      auto const is_addressof{ op == jank_cpp::OP_Amp && arg_types.size() == 1 };
+       auto const always_use_builtin{ is_addressof };
+ 
+       if(always_use_builtin || cpp_util::is_primitive(obj_type))
+@@ -457,7 +457,7 @@
+                                            macro_expansions);
+       }
+ 
+-      auto const arity{ arg_count == 1 ? Cpp::kUnary : Cpp::kBinary };
++      auto const arity{ arg_count == 1 ? jank_cpp::kUnary : jank_cpp::kBinary };
+       cppinterop::get_operator(op, arg_types, fns, arity);
+ 
+       if(fns.empty())
+@@ -5539,7 +5539,7 @@
+             ->add_usage(object_source(o));
+         }
+ 
+-        native_vector<Cpp::TemplateArgInfo> args;
++        native_vector<jank_cpp::TemplateArgInfo> args;
+         for(auto const arg : make_sequence_range(rest(o)))
+         {
+           if(runtime::is_integral(arg))
+--- a/compiler+runtime/src/cpp/jank/codegen/cpp_processor.cpp
++++ b/compiler+runtime/src/cpp/jank/codegen/cpp_processor.cpp
+@@ -1794,7 +1794,7 @@
+   jtl::option<identifier> gen(ir::inst::cpp_builtin_operator_call_ref const inst, builder &b)
+   {
+     b.next_instruction();
+-    auto const op_name{ operator_name(static_cast<Cpp::Operator>(inst->expr->op)).unwrap() };
++    auto const op_name{ operator_name(static_cast<jank_cpp::Operator>(inst->expr->op)).unwrap() };
+ 
+     if(inst->args.size() == 1)
+     {
+--- a/compiler+runtime/src/cpp/jank/ir/print.cpp
++++ b/compiler+runtime/src/cpp/jank/ir/print.cpp
+@@ -644,7 +644,7 @@
+     util::format_to(sb,
+                     "{:name {} :op :cpp/builtin-operator-call :op \"{}\" :args [",
+                     name,
+-                    operator_name(static_cast<Cpp::Operator>(expr->op)).unwrap());
++                    operator_name(static_cast<jank_cpp::Operator>(expr->op)).unwrap());
+     bool needs_space{};
+     for(auto const &arg : args)
+     {
+--- a/compiler+runtime/src/cpp/jank/jit/processor_dynamic.cpp
++++ b/compiler+runtime/src/cpp/jank/jit/processor_dynamic.cpp
+@@ -20,7 +20,7 @@
+ #include <llvm/Support/Signals.h>
+ 
+ #include <CppInterOp/Compatibility.h>
+-#include <CppInterOp/CppInterOp.h>
++#include <jank/analyze/cppinterop_extensions.hpp>
+ 
+ #include <jank/jit/object.hpp>
+ #include <jank/jit/parse_ld_script.hpp>
+--- a/compiler+runtime/src/cpp/main.cpp
++++ b/compiler+runtime/src/cpp/main.cpp
+@@ -8,7 +8,7 @@
+ #include <isocline.h>
+ 
+ #include <CppInterOp/Compatibility.h>
+-#include <CppInterOp/CppInterOp.h>
++#include <jank/analyze/cppinterop_extensions.hpp>
+ 
+ #include <jank/read/lex.hpp>
+ #include <jank/read/parse.hpp>
+@@ -262,7 +262,7 @@
+       jank_init_core_libs();
+ #endif
+ 
+-      Cpp::EnableDebugOutput(false);
++      jank_cpp::EnableDebugOutput(false);
+ 
+       {
+         runtime::detail::native_transient_vector extra_args;
+--- a/compiler+runtime/test/cpp/jank/analyze/cpp_util.cpp
++++ b/compiler+runtime/test/cpp/jank/analyze/cpp_util.cpp
+@@ -56,14 +56,14 @@
+         conversion_index = i;
+       }
+     }
+-    auto const one_arg_signature{ cppinterop::get_function_signature(fns[one_arg_index]) };
+-    auto const conversion_signature{ cppinterop::get_function_signature(fns[conversion_index]) };
+-    auto const arity_signature{ cppinterop::get_function_signature(fns[arity_index]) };
+-    auto const deleted_signature{ cppinterop::get_function_signature(fns[deleted_index]) };
+-    CHECK(candidates[0].signature == one_arg_signature);
+-    CHECK(candidates[1].signature == deleted_signature);
+-    CHECK(candidates[2].signature == conversion_signature);
+-    CHECK(candidates[3].signature == arity_signature);
++    jtl::immutable_string const one_arg_signature{ cppinterop::get_function_signature(fns[one_arg_index]) };
++    jtl::immutable_string const conversion_signature{ cppinterop::get_function_signature(fns[conversion_index]) };
++    jtl::immutable_string const arity_signature{ cppinterop::get_function_signature(fns[arity_index]) };
++    jtl::immutable_string const deleted_signature{ cppinterop::get_function_signature(fns[deleted_index]) };
++    DOCTEST_CHECK(candidates[0].signature == one_arg_signature);
++    DOCTEST_CHECK(candidates[1].signature == deleted_signature);
++    DOCTEST_CHECK(candidates[2].signature == conversion_signature);
++    DOCTEST_CHECK(candidates[3].signature == arity_signature);
+   }
+ 
+   TEST_CASE("resolve_candidates ranks access/const violations above conversion failures")
+@@ -119,9 +119,61 @@
+         public_index = i;
+       }
+     }
+-    auto const private_signature{ cppinterop::get_function_signature(fns[private_index]) };
+-    auto const public_signature{ cppinterop::get_function_signature(fns[public_index]) };
+-    CHECK(candidates[0].signature == private_signature);
+-    CHECK(candidates[1].signature == public_signature);
++    jtl::immutable_string const private_signature{ cppinterop::get_function_signature(fns[private_index]) };
++    jtl::immutable_string const public_signature{ cppinterop::get_function_signature(fns[public_index]) };
++    DOCTEST_CHECK(candidates[0].signature == private_signature);
++    DOCTEST_CHECK(candidates[1].signature == public_signature);
+   }
+ }
++
++TEST_SUITE("analyze/upstream_cppinterop")
++{
++  using namespace jank::analyze;
++
++  TEST_CASE("non-reference types and arrays preserve the facade contract")
++  {
++    auto const integer{ cpp_util::int_type() };
++    DOCTEST_CHECK(cppinterop::get_non_reference_type(integer) == integer);
++    auto const array{ cppinterop::get_array_type(integer, 4) };
++    DOCTEST_CHECK(cppinterop::get_array_size(array) == 4);
++    DOCTEST_CHECK(cppinterop::get_pointee_type(array) == integer);
++  }
++
++  TEST_CASE("function templates and qualified constructors remain discoverable")
++  {
++    jank::runtime::__rt_ctx->eval_cpp_string(R"cpp(
++      namespace jank::test::upstream_cppinterop {
++        template<class T> T identity(T x) { return x; }
++        struct widget {
++          template<class T> widget(T const&) {}
++        };
++        int choose(int);
++        int choose(double);
++      }
++    )cpp").expect_ok();
++    auto const scope{ cppinterop::get_scope_from_complete_name("jank::test::upstream_cppinterop") };
++    REQUIRE(scope);
++    auto const templates{ cppinterop::get_functions_using_name(scope, "identity") };
++    REQUIRE(templates.size() == 1);
++    DOCTEST_CHECK(cppinterop::is_templated_function(templates.front()));
++    auto const integer{ cpp_util::int_type() };
++    jank_cpp::TemplateArgInfo const argument{ integer };
++    auto const instance{ cppinterop::instantiate_template(templates.front(), &argument, 1, true) };
++    REQUIRE(instance);
++    DOCTEST_CHECK(cppinterop::get_canonical_type(cppinterop::get_function_return_type(instance))
++          == cppinterop::get_canonical_type(integer));
++    auto const widget{ cppinterop::get_named("widget", scope) };
++    REQUIRE(widget);
++    std::vector<cppinterop::clang_decl> constructors;
++    cppinterop::lookup_constructors("jank::test::upstream_cppinterop::widget", widget, constructors);
++    REQUIRE(!constructors.empty());
++    auto const functions{ cppinterop::get_functions_using_name(scope, "choose") };
++    REQUIRE(functions.size() == 2);
++    auto const best{ cppinterop::best_overload_match(functions, { integer }, {}) };
++    REQUIRE(best.size() == 1);
++    auto const info{ cppinterop::get_overload_candidate_info(best.front(), { integer }, {}) };
++    DOCTEST_CHECK(info.m_Viable);
++    REQUIRE(info.m_Arguments.size() == 1);
++    DOCTEST_CHECK(info.m_Arguments.front().m_Conversion == jank_cpp::OverloadCandidateConversion::None);
++  }
++}

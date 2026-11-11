@@ -1,7 +1,7 @@
 From: conda-forge maintainers
 Subject: [PATCH] Use packaged Boost, Folly, cpptrace and JSON
 
-Keep the patched BDWGC and LLVM 23 CppInterOp sources. External library
+Keep pointer-masked BDWGC; separate patches adapt packaged CppInterOp. External library
 headers remain owned by their runtime packages; explicitly link shared
 dependencies when consuming jank's merged runtime archive.
 

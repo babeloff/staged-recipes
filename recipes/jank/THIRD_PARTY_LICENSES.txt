@@ -1,13 +1,15 @@
 Third-party code included in jank
 =================================
 
-The remaining vendored components are BDWGC (MIT-style), CppInterOp
-(Apache-2.0 WITH LLVM-exception), Immer (BSL-1.0), isocline (MIT),
+The remaining vendored components are BDWGC (MIT-style), CppInterOp private
+headers and jank's adapted fork extensions (Apache-2.0 WITH LLVM-exception),
+Immer (BSL-1.0), isocline (MIT),
 nanobench (MIT), stduuid (MIT), and kuba--/zip (MIT).
 Their upstream license texts are included alongside this notice.
 
 Boost header code (BSL-1.0) is supplied by conda-forge libboost-headers.
-Folly and cpptrace are supplied as separate shared-library packages.
+Folly, cpptrace, and the upstream CppInterOp library are supplied as separate
+shared-library packages.
 
 nlohmann-json header code is supplied by conda-forge nlohmann_json and
 compiled into jank. Its license follows.

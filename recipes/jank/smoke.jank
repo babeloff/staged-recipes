@@ -8,5 +8,19 @@
 (assert (= "jank-smoke" (:out (shell/sh "printf" "jank-smoke"))))
 (assert (= {"answer" 42} (json/read-str (json/write-str {"answer" 42}))))
 
+; Exercise upstream CppInterOp through jank's overload and template facade.
+(cpp/raw "
+namespace jank_conda_test {
+  inline int choose(int) { return 11; }
+  inline int choose(double) { return 22; }
+  template<class T> inline T twice(T value) { return value + value; }
+  inline int read_ref(int const& value) { return value; }
+}
+")
+(assert (= 11 (cpp/jank_conda_test.choose (cpp/int. 1))))
+(assert (= 22 (cpp/jank_conda_test.choose (cpp/double. 1))))
+(assert (= 42 (cpp/jank_conda_test.twice (cpp/int. 21))))
+(assert (= 7 (cpp/jank_conda_test.read_ref (cpp/int. 7))))
+
 (defn -main []
   (println "jank-smoke"))

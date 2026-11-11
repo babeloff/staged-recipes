@@ -15,11 +15,14 @@ source:
     patches:
       - use-system-libraries.patch
       - fix-aot-constant-types.patch
+      - cppinterop-2-api.patch
+      - use-packaged-cppinterop.patch
   - url: https://github.com/jank-lang/immer/archive/282629d01917d4c7d0aba2322de700c6d1111276.tar.gz
     sha256: 21a6ef49a3e9ab3c8613fc5a6ef4b8f3ad2abce0d4ceb00e4be1bce052e6532a
     target_directory: compiler+runtime/third-party/immer
-  - url: https://github.com/jank-lang/CppInterOp/archive/f7e840b4f99693741448f16f889855e29adecde6.tar.gz
-    sha256: f536ae6612c0c245d2e2487b7e7451d708dfdc201fed1e658c506aad18615dc5
+  # Private interpreter headers only; link the matching conda-forge library.
+  - url: https://github.com/compiler-research/CppInterOp/archive/refs/tags/v2.0.0.tar.gz
+    sha256: 59c1118a02edd1b1a69b5ea2f223b849bc5f1cb51abec40930d33f432f7f1260
     target_directory: compiler+runtime/third-party/cppinterop
   - url: https://github.com/jank-lang/bdwgc/archive/327ef1f8c80a611b2f8b915850c8b2fd38e6595e.tar.gz
     sha256: 0c273a852db08def4e447d2f82b081c6f595f1e65169750bf5374e485a8311de
@@ -35,7 +38,7 @@ source:
     target_directory: compiler+runtime/third-party/isocline
 
 build:
-  number: 1
+  number: 2
   skip: win
   script:
     interpreter: nu
@@ -47,11 +50,12 @@ build:
         $env.DYLD_LIBRARY_PATH = $"($env.PREFIX)/lib"
       }
 
-      let linker_flags = if ($env.HOST | str contains "darwin") {
+      let extra_linker_flags = if ($env.HOST | str contains "darwin") {
         $"-L($env.PREFIX)/lib -lzstd -lfolly -lcpptrace"
       } else {
         $"-L($env.PREFIX)/lib -ldl -lzstd -lfolly -lcpptrace -pthread -Wl,--no-as-needed"
       }
+      let linker_flags = $"($env.LDFLAGS? | default '') ($extra_linker_flags)"
 
       ^./bin/configure -Djank_test=OFF -DFETCHCONTENT_FULLY_DISCONNECTED=ON -GNinja -DCMAKE_BUILD_TYPE=Release $"-DCMAKE_PREFIX_PATH=($env.PREFIX)" $"-Dclang_dir=($env.PREFIX)" $"-DCMAKE_EXE_LINKER_FLAGS=($linker_flags)"
       ^./bin/compile
@@ -74,6 +78,8 @@ requirements:
     - ${{ compiler('c') }}
     - ${{ compiler('cxx') }}
     - ${{ stdlib('c') }}
+    # Compiler activation packages are versioned 23.1; pin their implementation.
+    - clangxx ==23.1.4
     - if: linux
       then: binutils
     - cmake
@@ -92,18 +98,21 @@ requirements:
     - gflags
     - folly * [build="^h[0-9a-f]+_[0-9]+$"]
     - cpptrace >=1.0.4,<1.1
+    - cppinterop ==2.0.0 [build="clang23_repl_*"]
     - nlohmann_json >=3.12,<4
-    - clangdev 23.*
-    - libclang-cpp 23.*
-    - llvmdev 23.*
+    # CppInterOp embeds LLVM 23.1.4; its private Clang ABI must match.
+    - clangdev ==23.1.4
+    - libclang-cpp ==23.1.4
+    - llvmdev ==23.1.4
     - zlib
     - zstd
 
   run:
+    - cppinterop ==2.0.0 [build="clang23_repl_*"]
     - folly * [build="^h[0-9a-f]+_[0-9]+$"]
     - ${{ pin_compatible('libboost-headers', upper_bound='x.x') }}
-    - clang 23.*
-    - clangdev 23.*
+    - clang ==23.1.4
+    - clangdev ==23.1.4
 
 tests:
   - package_contents:
